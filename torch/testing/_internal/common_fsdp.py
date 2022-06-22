@@ -531,13 +531,14 @@ class FSDPTest(MultiProcessTestCase):
         model_init_fn,
         *args,
         ref_ddp_fn=None,
-        num_steps=2,
+        num_steps=1,
         fsdp_init_mode=FSDPInitMode.CUDA_AFTER,
         lr=0.01,
         cpu_offload=CPUOffload(),
         backward_prefetch=None,
         forward_prefetch=False,
         sharding_strategy=None,
+        use_orig_params=False,
         mixed_precision=None,
         save_model=True,
         clip_norm=0.3,
@@ -575,9 +576,10 @@ class FSDPTest(MultiProcessTestCase):
                 forward_prefetch=forward_prefetch,
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mixed_precision,
+                use_orig_params=use_orig_params,
             )
         except Exception as e:
-            raise ValueError(f"model_Init_fn {model_init_fn} got error {str(e)}")
+            raise ValueError(f"model_init_fn {model_init_fn} got error {str(e)}")
 
         cpu_offload = cpu_offload or CPUOffload()  # disabled if not specified.
         model = FullyShardedDataParallel(
@@ -587,6 +589,7 @@ class FSDPTest(MultiProcessTestCase):
             forward_prefetch=forward_prefetch,
             sharding_strategy=sharding_strategy,
             mixed_precision=mixed_precision,
+            use_orig_params=use_orig_params,
         )
         # Call model.cuda() after init FSDP if specified.
         if fsdp_init_mode == FSDPInitMode.CUDA_AFTER:

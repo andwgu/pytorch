@@ -642,6 +642,7 @@ class FullyShardedDataParallel(nn.Module):
         device_id: Optional[Union[int, torch.device]] = None,
         sync_module_states: bool = False,
         forward_prefetch: bool = False,
+        use_orig_params: bool = False,
     ):
         if isinstance(auto_wrap_policy, ParamExecOrderWrapPolicy):
             self._init_param_exec_order_wrap_policy(
@@ -725,6 +726,7 @@ class FullyShardedDataParallel(nn.Module):
                 param_init_fn=param_init_fn,
                 device_id=device_id,
                 sync_module_states=sync_module_states,
+                use_orig_params=use_orig_params,
             )
 
         self.process_group = process_group or _get_default_group()
@@ -829,7 +831,8 @@ class FullyShardedDataParallel(nn.Module):
         # shard any leftover parameters.
         params = [
             p for p in module.parameters()
-            if p not in ignored_params and not isinstance(p, FlatParameter)
+            if p not in ignored_params and not isinstance(p, FlatParameter) and
+            not hasattr(p, "_flattened")
         ]
 
         if sync_module_states:
@@ -857,7 +860,8 @@ class FullyShardedDataParallel(nn.Module):
                 src=0,
             )
 
-        self._fsdp_wrapped_module = FlattenParamsWrapper(module, params)
+        self._use_orig_params = use_orig_params
+        self._fsdp_wrapped_module = FlattenParamsWrapper(module, params, use_orig_params)
         assert getattr(self, FSDP_WRAPPED_MODULE) is self._fsdp_wrapped_module
         self.params = []
         if self._fsdp_wrapped_module.has_params:
@@ -867,14 +871,15 @@ class FullyShardedDataParallel(nn.Module):
         # Shard module parameters in place
         self._shard_parameters()
 
-        # Check that the sharding logic was applied to all parameters by
-        # checking that the original module parameters have been replaced by
-        # `Tensor` views and are no longer `nn.Parameter`s
-        for n, p in self.named_parameters():
-            if p not in ignored_params and not isinstance(p, FlatParameter):
-                raise RuntimeError(
-                    f"found unflattened parameter: {n} ; {p.size()} {p.__class__}"
-                )
+        if not use_orig_params:
+            # Check that the sharding logic was applied to all parameters by
+            # checking that the original module parameters have been replaced
+            # by `Tensor` views and are no longer `nn.Parameter`s
+            for n, p in self.named_parameters():
+                if p not in ignored_params and not isinstance(p, FlatParameter):
+                    raise RuntimeError(
+                        f"found unflattened parameter: {n}; {p.size()} {p.__class__}"
+                    )
         self._reset_lazy_init()
 
         # Flag indicating if we require gradient reduction in the backward
@@ -1420,14 +1425,14 @@ class FullyShardedDataParallel(nn.Module):
                 p.is_floating_point()
             ), "Autograd does not support operations for integer type."
 
-            # Sharding is done only when world_size is larger than 1 and
-            # sharding_strategy!=NO_SHARD.
             p._is_sharded = (  # type: ignore[attr-defined]
                 self.world_size > 1
                 and self.sharding_strategy != ShardingStrategy.NO_SHARD
             )
 
             if not p._is_sharded:  # type: ignore[attr-defined]
+                if handle._use_orig_params:
+                    handle.init_shard(self.rank, self.world_size)
                 continue
 
             # Save the original storage and free it later on.
@@ -1438,10 +1443,8 @@ class FullyShardedDataParallel(nn.Module):
             ), "The tensor is not the sole occupant of the storage."
             orig_storage = p.storage()
 
-            # Replace p with the relevant shard.
-            local_shard, numel_padded = FlatParamHandle._get_shard(p, self.rank, self.world_size)
-            p.set_(local_shard)  # type: ignore[call-overload]
-            handle.init_shard_metadata(local_shard.numel(), numel_padded, self.rank)
+            # Construct and use the sharded flattened parameter
+            handle.init_shard(self.rank, self.world_size)
 
             # Free storage that contains the original full data.
             if orig_storage.size() > 0:
@@ -1519,6 +1522,8 @@ class FullyShardedDataParallel(nn.Module):
                 for param in fsdp_module.params:
                     fsdp_module._init_param_attributes(param)
 
+    # TODO (awgu): Make this per handle...
+    # def _init_param_attributes(self, handle: FlatParamHandle) -> None:
     @torch.no_grad()
     def _init_param_attributes(self, p: Parameter) -> None:
         """
@@ -1580,6 +1585,18 @@ class FullyShardedDataParallel(nn.Module):
             p._cpu_grad = torch.zeros_like(  # type: ignore[attr-defined]
                 p, device=torch.device("cpu")
             ).pin_memory()
+        
+        # if self._use_orig_params:
+        #     devices = set(orig_param.device for orig_param in p._params)
+        #     name_to_device = {}
+        #     for i, param in enumerate(p._params):
+        #         name_to_device[p._prefixed_param_names[i]] = param.device
+        #     assert len(devices) == 1, f"{devices} {name_to_device}"
+            # TODO (awgu): CUDA after is problematic...
+            # device = next(iter(devices))
+            # if p.device != device:
+            #     print(f"[Rank {self.rank}] moving local shard to {device}")
+            #     p._local_shard = p._local_shard.to(device)
 
         # If mixed_precision, maintain reduced precision param shard on
         # compute_device for computation in fwd/bwd. We resize storage to 0 here
@@ -2469,6 +2486,10 @@ class FullyShardedDataParallel(nn.Module):
                             self._write_back_current_shard(currently_local_params)
                         stack.close()
                         _free_full_params_and_use_local_shard(currently_local_params)
+                        for handle in self._handles:
+                            if handle._use_orig_params:
+                                handle._use_sharded_views()
+                                handle._use_sharded_grad_views()
                         self.training_state = TrainingState_.IDLE
 
     @staticmethod
@@ -3003,7 +3024,10 @@ class FullyShardedDataParallel(nn.Module):
             if isinstance(m, FullyShardedDataParallel):
                 _finalize_params(m)
                 m._pre_backward_hook_has_run = False
-                if any(p.requires_grad for p in m.parameters()):
+                # TODO (awgu): need `all_params` because `parameters()` does
+                # not return `FlatParameter`s
+                all_params = set(m.parameters()).union(set(m.params))
+                if any(p.requires_grad for p in all_params):
                     # Check if the module has params and if any of them has
                     # the `requires_grad` field set. If `requires_grad=False` for
                     # all the params, the post_backward hook will not fire and the
@@ -3026,6 +3050,11 @@ class FullyShardedDataParallel(nn.Module):
                 if m._is_root:
                     # reset this flag for cases like "one forward pass + multiple backward passes"
                     self._post_backward_callback_queued = False
+                if m._use_orig_params:  # TODO (awgu): assumes all handles share the same `_use_orig_params`
+                    for handle in m._handles:
+                        m._fsdp_wrapped_module._deregister_flat_param()  # registered to the FPW
+                        handle._use_sharded_views()
+                        handle._use_sharded_grad_views()
 
         if self._use_param_exec_order_policy() and self._param_exec_order_prep_stage:
             self._param_exec_order_policy_second_iter_init()
@@ -3170,6 +3199,8 @@ class FullyShardedDataParallel(nn.Module):
                         _alloc_storage(p._full_param_padded, size=p_full_size)  # type: ignore[attr-defined]
                         output_tensor = p._full_param_padded  # type: ignore[attr-defined]
                     # Fill output_tensor with (p.data for each shard in self.world_size)
+                    assert p_data.is_cuda
+                    assert output_tensor.is_cuda
                     dist._all_gather_base(
                         output_tensor, p_data, group=self.process_group
                     )
@@ -3392,6 +3423,43 @@ class FullyShardedDataParallel(nn.Module):
                 print(f"ERROR: {msg}")
                 traceback.print_stack()
             raise ValueError(msg)
+
+    @contextlib.contextmanager
+    def _deregister_orig_params(self):
+        assert self._use_orig_params
+        for fsdp_module in self.fsdp_modules(self):
+            handle = fsdp_module._fsdp_wrapped_module.handle
+            flat_param = handle.flat_param
+            # TODO (awgu): This `_is_sharded` means that in the parameterization,
+            # this parameter is sharded (i.e. that the original parameters are
+            # exposed) -- for NO_SHARD, the parameter is still actually not sharded
+            is_sharded = flat_param.size() == flat_param._sharded_size
+            if is_sharded:
+                handle._deregister_orig_params()
+                fsdp_module._fsdp_wrapped_module._register_flat_param()
+        try:
+            yield
+        finally:
+            for fsdp_module in self.fsdp_modules(self):
+                handle = fsdp_module._fsdp_wrapped_module.handle
+                flat_param = handle.flat_param
+                is_sharded = flat_param.size() == flat_param._sharded_size
+                if is_sharded:
+                    fsdp_module._fsdp_wrapped_module._deregister_flat_param()
+                    fsdp_module._fsdp_wrapped_module.handle._use_sharded_views()
+                    fsdp_module._fsdp_wrapped_module.handle._use_sharded_grad_views()
+
+    def _apply(self, *args, **kwargs):
+        """
+        When using the original parameters, this exposes only the
+        :class:`FlatParameter` s before calling ``_apply()``.
+        """
+        if self._use_orig_params:
+            context = self._deregister_orig_params()
+        else:
+            context = contextlib.suppress()
+        with context:
+            return super()._apply(*args, **kwargs)
 
     @contextmanager
     def no_sync(self) -> Generator:

@@ -919,11 +919,13 @@ class FullyShardedDataParallel(nn.Module):
 
         # Flag to guard against preparing gradients multiple times per backward pass.
         self._pre_bwd_hook_has_run: Dict[Tuple[FlatParameter, ...], bool] = {}
-        # Used for prefetching all gather full params in post backward hook
-        self._need_rebuild_full_params = False
+        # Used for prefetching FSDP parameters in the pre-forward
+        self._pre_fwd_params_prefetched: Dict[Tuple[FlatParameter, ...], bool] = {}
+        # Used for prefetching FSDP parameters in the post-backward hook
         # TODO (awgu): change this to Dict[Tuple[FlatParameter, ...], bool]
         # for non-recursive wrapping path since there is only one top-level
         # FSDP instance
+        self._need_rebuild_full_params = False
 
         # If specified, offload parameter shard to CPU.
         if self.cpu_offload.offload_params:
@@ -1600,10 +1602,9 @@ class FullyShardedDataParallel(nn.Module):
         """
         self._is_root: Optional[bool] = None
         self._streams: Dict[str, torch.cuda.Stream] = {}
-        self._fsdp_graph_order: List[nn.Module] = []
+        self._fsdp_graph_order: List[FullyShardedDataParallel] = []
         self._my_fsdp_idx_in_graph: Optional[int] = None
         self._pre_backward_hook_full_params_prefetched: bool = False
-        self._forward_full_params_prefetched: bool = False
 
         for p in self.params:
             if hasattr(p, "_local_shard"):
@@ -2437,18 +2438,53 @@ class FullyShardedDataParallel(nn.Module):
             free_mp_shard=self._mixed_precision_enabled_for_params(),
         )
 
+    def _pre_forward_unshard(self, params: List[FlatParameter]) -> None:
+        """
+        This unshards the parameters ``params`` in the all-gather stream and
+        syncs the current stream with the all-gather stream.
+        """
+        self._rebuild_full_params(params)
+        torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
+
+    def _pre_forward_unshard_with_prefetch(self) -> None:
+        """
+        This unshards parameters in the pre-forward including logic for forward
+        prefetching. This is only meant for the recursive wrapping path.
+        """
+        key = tuple(self.params)
+        prefetched = self._pre_fwd_params_prefetched.get(key, False)
+        if not prefetched:
+            self._rebuild_full_params(self.params)
+        self._pre_fwd_params_prefetched[key] = False
+        torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
+        if self._need_prefetch_full_params(TrainingState_.FORWARD):
+            # This stream sync ensures that prefetching the next FSDP module's
+            # parameters (in the all-gather stream) happens after any existing
+            # computation (in the current stream), which means that the
+            # prefetching only overlaps with the current FSDP module's
+            # computation, avoiding over-prefetching where multiple FSDP
+            # modules' parameters are prefetched before computation.
+            self._streams["all_gather"].wait_stream(torch.cuda.current_stream())
+            next_fsdp = self._fsdp_graph_order[self._my_fsdp_idx_in_graph + 1]
+            next_fsdp_params = tuple(next_fsdp.params)
+            if next_fsdp_params:
+                next_fsdp._rebuild_full_params(next_fsdp_params)
+            next_fsdp._pre_fwd_params_prefetched[next_fsdp_params] = True
+
     def _pre_forward(
         self,
         handles: List[FlatParamHandle],
         reshard_fn: Optional[Callable],
+        unshard_fn: Optional[Callable],
         module: nn.Module,
         input: Any,
     ):
         """
         Runs the pre-forward logic. This includes an opportunity to reshard
-        currently unsharded parameters such as those from previous forwards,
-        unsharding the parameters for the current forward, and registering
-        post-backward hooks on these current parameters.
+        currently unsharded parameters such as those from previous forwards; an
+        opportunity to unshard currently sharded parameters such as those for
+        the current forward; and registering post-backward hooks on these
+        current parameters.
 
         For the non-recursive wrapping path, the original parameters are
         unflattened here in the pre-forward, while in the recursive wrapping
@@ -2459,8 +2495,11 @@ class FullyShardedDataParallel(nn.Module):
             handles (List[FlatParamHandle]): Handles giving the parameters
                 used in the current forward.
             reshard_fn (Optional[Callable]): A callable to reshard any
-                currently unsharded parameters e.g. from previous forwards or
+                currently unsharded parameters (e.g. from previous forwards) or
                 ``None`` to not do any resharding.
+            unshard_fn (Optional[Callable]): A callable to unshard any
+                currently sharded parameters or ``None`` to not do any
+                unsharding.
             module (nn.Module): Unused; expected by the hook signature.
             input (Any): Unused; exepcted by the hook signature.
         """
@@ -2470,21 +2509,21 @@ class FullyShardedDataParallel(nn.Module):
             self.training_state = TrainingState_.FORWARD
             if reshard_fn is not None:
                 reshard_fn()
-            params = [handle.flat_param for handle in handles]
-            self._rebuild_full_params(params)
-            torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
+            if unshard_fn is not None:
+                unshard_fn()
             if self._use_param_exec_order_policy:
                 for handle in handles:
                     handle._unflatten(as_params=False)
             # Register post-backward hooks to reshard the parameters and
             # reduce-scatter their gradients. They must be re-registered every
             # forward pass in case the `grad_fn` is mutated.
-            self._register_post_backward_hooks(params)
+            self._register_post_backward_hooks([handle.flat_param for handle in handles])
 
     def _post_forward(
         self,
         handles: List[FlatParamHandle],
         reshard_fn: Optional[Callable],
+        unshard_fn: Optional[Callable],
         module: nn.Module,
         input: Any,
         output: Any,
@@ -2492,14 +2531,19 @@ class FullyShardedDataParallel(nn.Module):
         """
         Runs the post-forward logic. This includes an opportunity to reshard
         currently unsharded parameters such as those used in the current
-        forward and registering pre-backward hooks on the forward outputs.
+        forward; an opportunity to unshard currently sharded parameters such as
+        those for the next forward; and registering pre-backward hooks on the
+        forward outputs.
 
         Args:
             handles (List[FlatParamHandle]): Handles giving the parameters
                 used in the current forward.
             reshard_fn (Optional[Callable]): A callable to reshard any
-                currently unsharded parameters e.g. from the current forward or
-                ``None`` to not do any resharding.
+                currently unsharded parameters (e.g. from the current forward)
+                or ``None`` to not do any resharding.
+            unshard_fn (Optional[Callable]): A callable to unshard any
+                currently sharded parameters or ``None`` to not do any
+                unsharding.
             module (nn.Module): Unused; expected by the hook signature.
             input (Any): Unused; exepcted by the hook signature.
             output (Any): Forward pass output; pre-backward hooks are
@@ -2516,6 +2560,8 @@ class FullyShardedDataParallel(nn.Module):
                 self._fsdp_graph_order.append(self)
             if reshard_fn is not None:
                 reshard_fn()
+            if unshard_fn is not None:
+                unshard_fn()
             # Register pre-backward hooks to unshard the flattened parameters for
             # the gradient computation if needed
             output = self._register_pre_backward_hooks(output, [handle.flat_param for handle in handles])
@@ -2560,16 +2606,17 @@ class FullyShardedDataParallel(nn.Module):
                 self.reshard_after_forward and
                 self._mixed_precision_enabled_for_params()
             )
+            unshard_fn = self._pre_forward_unshard_with_prefetch
             reshard_fn = functools.partial(
                 self._reshard,
                 [handle.flat_param for handle in self._handles],
                 free_full_params,
                 free_mp_shard,
             )
-            self._pre_forward(self._handles, unused, unused, unused)
+            self._pre_forward(self._handles, unused, unshard_fn, unused, unused)
             self._cast_forward_inputs(*args, **kwargs)
             output = self._fsdp_wrapped_module(*args, **kwargs)
-            return self._post_forward(self._handles, reshard_fn, unused, unused, output)
+            return self._post_forward(self._handles, reshard_fn, unused, unused, unused, output)
 
     def _register_pre_forward_hooks(self):
         """
@@ -2583,9 +2630,16 @@ class FullyShardedDataParallel(nn.Module):
             forward_handle.remove()
         self._pre_forward_handles.clear()
         for module in self.module.modules():
-            module_flat_param_handles = self._module_to_handles[module]
-            reshard_fn = None # functools.partial(self._pre_forward_reshard, module_flat_param_handles)
-            hook = functools.partial(self._pre_forward, module_flat_param_handles, reshard_fn)
+            module_param_handles = self._module_to_handles[module]
+            unshard_fn = functools.partial(
+                self._pre_forward_unshard,
+                [handle.flat_param for handle in module_param_handles],
+            )
+            # TODO (awgu)(linjianma): `params_to_reshard` is incorrect, so we
+            # are disabling the pre-forward reshard
+            # reshard_fn = functools.partial(self._pre_forward_reshard, module_param_handles)
+            reshard_fn = None
+            hook = functools.partial(self._pre_forward, module_param_handles, reshard_fn, unshard_fn)
             self._pre_forward_handles.append(module.register_forward_pre_hook(hook))
 
     def _register_post_forward_hooks(self):
@@ -2600,13 +2654,15 @@ class FullyShardedDataParallel(nn.Module):
             forward_handle.remove()
         self._post_forward_handles.clear()
         for module in self.module.modules():
+            module_param_handles = self._module_to_handles[module]
+            unshard_fn = None
             reshard_fn = functools.partial(
                 self._reshard,
-                [handle.flat_param for handle in self._module_to_handles[module]],
+                [handle.flat_param for handle in module_param_handles],
                 free_full_params=True,
                 free_mp_shard=self._mixed_precision_enabled_for_params(),
             )
-            hook = functools.partial(self._post_forward, self._module_to_handles[module], reshard_fn)
+            hook = functools.partial(self._post_forward, module_param_handles, reshard_fn, unshard_fn)
             self._post_forward_handles.append(module.register_forward_hook(hook))
 
     @torch.no_grad()
@@ -3272,7 +3328,7 @@ class FullyShardedDataParallel(nn.Module):
             for p in fsdp_module.params:
                 if p.requires_grad:
                     if hasattr(p, "_shard_bwd_hook"):
-                        p_assert(len(p._shard_bwd_hook) == 2, "Invalid `_shard_bwd_hook`") # type: ignore[attr-defined]
+                        p_assert(len(p._shard_bwd_hook) == 2, "Invalid `_shard_bwd_hook`")  # type: ignore[attr-defined]
                         p._shard_bwd_hook[1].remove()  # type: ignore[attr-defined]
                         delattr(p, "_shard_bwd_hook")
                     # Preserve the gradient accumulation state if not

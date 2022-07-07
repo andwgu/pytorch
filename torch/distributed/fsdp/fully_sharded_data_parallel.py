@@ -3357,7 +3357,10 @@ class FullyShardedDataParallel(nn.Module):
             # TODO (awgu) (linjianma): replace this `handles_per_flat_param`
             # with something more intelligent
             self._handles_exec_order.reverse()
-            assert set(self._handles_exec_order) == set(self._handles)
+            p_assert(
+                set(self._handles_exec_order) == set(self._handles),
+                f"{set(self._handles_exec_order)}\n{set(self._handles)}"
+            )
             handles_per_flat_param = self._bucket_handles(self.auto_wrap_policy.bucket_size)
             delattr(self, "_handles_exec_order")
             self._register_param_handles_from_handles(handles_per_flat_param)

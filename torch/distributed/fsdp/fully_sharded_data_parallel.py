@@ -2574,7 +2574,7 @@ class FullyShardedDataParallel(nn.Module):
         to the appropriate dtype if needed.
         """
         if not self._is_root:
-            return
+            return (args, kwargs)
         # TODO: Do not use the side stream for tensor copies for now;
         # investigate the perf with/without it
         # TODO: For mixed precision, move the inputs to the compute device and
@@ -2587,6 +2587,7 @@ class FullyShardedDataParallel(nn.Module):
             args, kwargs = self._cast_fp_inputs_to_precision(
                 input_dtype, *args, **kwargs,
             )
+        return (args, kwargs)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """
@@ -2597,7 +2598,7 @@ class FullyShardedDataParallel(nn.Module):
         with torch.autograd.profiler.record_function("FullyShardedDataParallel.forward"):
             # Non-recursive wrapping path (using hooks)
             if self._use_param_exec_order_policy:
-                self._cast_forward_inputs(*args, **kwargs)
+                args, kwargs = self._cast_forward_inputs(*args, **kwargs)
                 return self._fsdp_wrapped_module(*args, **kwargs)
             # Recursive wrapping path
             unused = None
@@ -2614,7 +2615,7 @@ class FullyShardedDataParallel(nn.Module):
                 free_mp_shard,
             )
             self._pre_forward(self._handles, unused, unshard_fn, unused, unused)
-            self._cast_forward_inputs(*args, **kwargs)
+            args, kwargs = self._cast_forward_inputs(*args, **kwargs)
             output = self._fsdp_wrapped_module(*args, **kwargs)
             return self._post_forward(self._handles, reshard_fn, unused, unused, unused, output)
 

@@ -926,6 +926,9 @@ class FullyShardedDataParallel(nn.Module):
         # for non-recursive wrapping path since there is only one top-level
         # FSDP instance
         self._need_rebuild_full_params = False
+        # TODO (awgu): change this to Dict[Tuple[FlatParameter, ...], bool]
+        # for non-recursive wrapping path since there is only one top-level
+        # FSDP instance
 
         # If specified, offload parameter shard to CPU.
         if self.cpu_offload.offload_params:
@@ -945,12 +948,50 @@ class FullyShardedDataParallel(nn.Module):
         if handle not in self._handles:
             self._handles.append(handle)
 
+    def _record_params_wrapper(
+        self,
+        params_per_wrapped_module: List[List[nn.Parameter]],
+        traversed_param_set: Set[nn.Parameter],
+        module: nn.Module,
+        **kwargs
+        ) -> nn.Module:
+        """
+        A ``wrapper_cls`` used in ``wrap._wrap`` to record parameters to
+        be grouped in one FlatParameter without adding a wrapped module to the input
+        ``module``. This is only used in ``ParamExecOrderPolicy``.
+        Args:
+            params_per_wrapped_module (List[List[nn.Parameter]]):
+                used to record the parameters of each wrapped module.
+            module (nn.Module): The input module.
+            kwargs: other keyword arguments passed in.
+        """
+        params = []
+        for p in module.parameters():
+            if p not in traversed_param_set:
+                params.append(p)
+                traversed_param_set.add(p)
+        params_per_wrapped_module.append(params)
+        return module
+
     def _get_params_per_wrapped_module(self, root_module) -> List[List[nn.Parameter]]:
-        # TODO (linjianma) modify it to wrap based on ``self.auto_wrap_policy.module_level_group_policy``
-        return [
-            list(module.parameters(recurse=False))
-            for module in root_module.modules()
-        ]
+        policy = self.auto_wrap_policy.module_level_group_policy
+        params_per_wrapped_module: List[List[nn.Parameter]] = []
+        traversed_param_set: Set[nn.Parameter] = set()
+        wrapper_cls: Callable = functools.partial(
+            self._record_params_wrapper,
+            params_per_wrapped_module,
+            traversed_param_set,
+        )
+        # TODO (linjianma): do we need to consider ignored_modules and ignored_params?
+        _recursive_wrap(
+            root_module,
+            auto_wrap_policy=policy,
+            wrapper_cls=wrapper_cls,
+            ignored_modules=[],
+            ignored_params=[],
+            only_wrap_children=False,
+            )
+        return params_per_wrapped_module
 
     def _register_param_handles_from_root_module(self, root_module) -> None:
         """

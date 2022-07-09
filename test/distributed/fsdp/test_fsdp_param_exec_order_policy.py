@@ -1,6 +1,7 @@
 # Owner(s): ["oncall: distributed"]
 
 import copy
+import functools
 import sys
 from typing import Any, Dict, List
 
@@ -14,7 +15,12 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
     OptimStateKeyType,
     StateDictType,
 )
-from torch.distributed.fsdp.wrap import HandleInitMode, ParamExecOrderPolicy, ParamExecOrderState
+from torch.distributed.fsdp.wrap import (
+    HandleInitMode,
+    ParamExecOrderPolicy,
+    ParamExecOrderState,
+    transformer_auto_wrap_policy
+)
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest
@@ -48,20 +54,30 @@ HANDLE_INIT_MAPPING = {
 }
 
 
-class CNN(nn.Module):
+class DoubleConv(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(3, 6, 5)
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(6, 16, 5)
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        return x
+
+
+class CNN(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = DoubleConv()
         self.fc1 = nn.Linear(16 * 5 * 5, 20)
         self.fc2 = nn.Linear(20, 20)
         self.fc3 = nn.Linear(20, 20)
         self.root_weight = torch.nn.Parameter(torch.randn(20, 20))
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
+        x = self.conv(x)
         x = torch.flatten(x, 1)
         x = F.relu(self.fc1(x))
         x = x @ self.root_weight
@@ -257,17 +273,25 @@ class TestFSDPExecOrderPolicy(FSDPTest):
     def test_fsdp_flatten_params_exec_order(self, iters: int):
         model = CNN().cuda()
         group = dist.distributed_c10d._get_default_group()
-        fsdp_model = FSDP(model, group, auto_wrap_policy=ParamExecOrderPolicy(HandleInitMode.MODULE_LEVEL))
+        # Used to test non-default module_level_group_policy
+        module_level_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={CNN, DoubleConv, nn.Linear},
+        )
+        param_exec_order_policy = ParamExecOrderPolicy(
+                handle_init_mode=HandleInitMode.MODULE_LEVEL,
+                module_level_group_policy=module_level_policy,
+            )
+        fsdp_model = FSDP(model, group, auto_wrap_policy=param_exec_order_policy)
         self.assertTrue(fsdp_model._use_param_exec_order_policy)
         self.assertTrue(fsdp_model._param_exec_order_state, ParamExecOrderState.UNINITIALIZED)
         params_list = copy.deepcopy(list(fsdp_model.parameters()))
         (
-            root_weight,
-            conv1_weight,
-            conv2_weight,
+            conv_weight,
             fc1_weight,
             fc2_weight,
             fc3_weight,
+            root_weight,
         ) = params_list
         for _ in range(iters):
             inp_shape = CNN.get_inp_shape()
@@ -284,8 +308,7 @@ class TestFSDPExecOrderPolicy(FSDPTest):
             params_exec_order_list,
             [
                 root_weight,
-                conv1_weight,
-                conv2_weight,
+                conv_weight,
                 fc1_weight,
                 fc3_weight,
                 fc2_weight,

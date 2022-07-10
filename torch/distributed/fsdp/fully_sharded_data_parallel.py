@@ -1662,13 +1662,15 @@ class FullyShardedDataParallel(nn.Module):
 
     def _lazy_init(self) -> None:
         """
-        Performs initialization lazily, typically right before the first
-        forward pass. The laziness is needed to ensure that the parameter
-        device/dtype and the FSDP hierarchy have finalized.
+        Performs initialization lazily. When uses a recursive wrapping, this is
+        typically right before the first forward pass. When using a
+        ``ParamExecOrderPolicy``, this is before the first or the second forward
+        pass. The laziness is needed to ensure that the parameter device/dtype
+        and the FSDP hierarchy have finalized.
 
         This method's actual logic only runs on the root FSDP instance, which
-        performs initialization for all non-root FSDP instances to avoid
-        partial initialization.
+        performs initialization for all non-root FSDP instances to avoid partial
+        initialization.
         """
         if self._is_root is not None:
             return  # no-op: already initialized
@@ -1702,13 +1704,13 @@ class FullyShardedDataParallel(nn.Module):
                 for param in fsdp_module.params:
                     fsdp_module._init_param_attributes(param)
 
-            # Set a flag on every FlatParameter to track whether its post
-            # backward hook has been called, mainly for validation purpose
-            # in wait_for_post_backward.
-            if self._exec_order_data.is_first_iter:
-                for m in self.fsdp_modules(self):
-                    for p in m.params:
-                        p._post_backward_called = False
+        # Set a flag on every FlatParameter to track whether its post
+        # backward hook has been called, mainly for validation purpose
+        # in wait_for_post_backward.
+        for m in self.fsdp_modules(self):
+            for p in m.params:
+                if not hasattr(p, "_post_backward_called"):
+                    p._post_backward_called = False
 
     @torch.no_grad()
     def _init_param_attributes(self, p: Parameter) -> None:
@@ -3505,6 +3507,8 @@ class FullyShardedDataParallel(nn.Module):
             delattr(self, "_handles_exec_order")
             self._register_param_handles_from_handles(handles_per_flat_param)
             self._param_exec_order_state = ParamExecOrderState.INITIALIZED
+            # Force it to reset
+            self._reset_lazy_init()
 
     def _bucket_handles(self, bucket_size: int) -> List[List[FlatParamHandle]]:
         """

@@ -12,6 +12,7 @@ from torch import distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FlatParameter,
+    MixedPrecision,
     OptimStateKeyType,
     StateDictType,
 )
@@ -53,6 +54,22 @@ HANDLE_INIT_MAPPING = {
     "param_level": HandleInitMode.PARAM_LEVEL,
 }
 
+default_mp = MixedPrecision(
+    param_dtype=torch.float16,
+    buffer_dtype=torch.float16,
+    reduce_dtype=torch.float16,
+)
+
+# Params and buffers are not cast, comm only happens
+# in reduced precision.
+mp_only_reduce = MixedPrecision(reduce_dtype=torch.float16)
+
+# Only parameters are cast (thus comm should happen in the param_dtype precision)
+mp_only_param_and_buf = MixedPrecision(param_dtype=torch.float16, buffer_dtype=torch.float16)
+
+# Nothing is cast (thus param, comm, grad, and buffer should be in the full precision)
+mp_no_mixed_precision = MixedPrecision()
+
 
 class DoubleConv(nn.Module):
     def __init__(self) -> None:
@@ -60,10 +77,17 @@ class DoubleConv(nn.Module):
         self.conv1 = nn.Conv2d(3, 6, 5)
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(6, 16, 5)
+        # Handles the edge chase when this parameter is wrapped together with
+        # parameters in the children modules
+        self.weight = torch.nn.Parameter(
+            torch.randn(16 * 5 * 5, 16 * 5 * 5)
+        )
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
         x = self.pool(F.relu(self.conv2(x)))
+        x = torch.flatten(x, 1)
+        x = x @ self.weight
         return x
 
 
@@ -78,7 +102,6 @@ class CNN(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
-        x = torch.flatten(x, 1)
         x = F.relu(self.fc1(x))
         x = x @ self.root_weight
         x = F.relu(self.fc3(x))
@@ -242,7 +265,7 @@ class TestFSDPExecOrderPolicy(FSDPTest):
         model_class = CNN
         optim_class = torch.optim.Adam
         fsdp_model, fsdp_optim, ddp_model, ddp_optim = self._init_fsdp_ddp(
-            model_class,optim_class, HANDLE_INIT_MAPPING[handle_init_mode],
+            model_class, optim_class, HANDLE_INIT_MAPPING[handle_init_mode],
         )
         inp_shape = model_class.get_inp_shape()
         fsdp_optim = self._warmup_fsdp(fsdp_model, optim_class, inp_shape)
@@ -271,12 +294,15 @@ class TestFSDPExecOrderPolicy(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("iters", [1, 3])
     def test_fsdp_flatten_params_exec_order(self, iters: int):
+        """
+        test the execution order of flatten parameters.
+        """
         model = CNN().cuda()
         group = dist.distributed_c10d._get_default_group()
         # Used to test non-default module_level_group_policy
         module_level_policy = functools.partial(
             transformer_auto_wrap_policy,
-            transformer_layer_cls={CNN, DoubleConv, nn.Linear},
+            transformer_layer_cls={DoubleConv, nn.Linear},
         )
         param_exec_order_policy = ParamExecOrderPolicy(
                 handle_init_mode=HandleInitMode.MODULE_LEVEL,
@@ -316,6 +342,42 @@ class TestFSDPExecOrderPolicy(FSDPTest):
         )
         self.assertTrue(fsdp_model._param_exec_order_state, ParamExecOrderState.INITIALIZED)
 
+    @skip_if_lt_x_gpu(2)
+    @parametrize("mp_config", [
+        default_mp, mp_only_reduce, mp_only_param_and_buf, mp_no_mixed_precision
+    ])
+    def test_fsdp_mixed_precision(self, mp_config: MixedPrecision):
+        """
+        test the wrapping with mixed precisions.
+        """
+        model = CNN().cuda()
+        group = dist.distributed_c10d._get_default_group()
+        # Used to test non-default module_level_group_policy
+        module_level_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={DoubleConv, nn.Linear},
+        )
+        param_exec_order_policy = ParamExecOrderPolicy(
+                handle_init_mode=HandleInitMode.MODULE_LEVEL,
+                module_level_group_policy=module_level_policy,
+            )
+        fsdp_model = FSDP(
+            model,
+            group,
+            auto_wrap_policy=param_exec_order_policy,
+            mixed_precision=mp_config,
+            )
+        inp_shape = CNN.get_inp_shape()
+        input = torch.randn(inp_shape).to(self.rank)
+        output = fsdp_model(input)
+        loss = output.sum()
+        loss.backward()
+        expected_param_type = (
+            mp_config.param_dtype if mp_config.param_dtype is not None
+            else torch.float32
+        )
+        for p in fsdp_model.parameters():
+            self.assertEqual(p.dtype, expected_param_type)
 
 instantiate_parametrized_tests(TestFSDPExecOrderPolicy)
 

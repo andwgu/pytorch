@@ -991,6 +991,11 @@ class FullyShardedDataParallel(nn.Module):
             ignored_params=[],
             only_wrap_children=False,
             )
+        # parameters not wrapped in ``policy`` are grouped together.
+        remaining_params = [
+            p for p in root_module.parameters() if p not in traversed_param_set
+        ]
+        params_per_wrapped_module.append(remaining_params)
         return params_per_wrapped_module
 
     def _register_param_handles_from_root_module(self, root_module) -> None:
@@ -1479,7 +1484,7 @@ class FullyShardedDataParallel(nn.Module):
             )
 
     @torch.no_grad()
-    def _cast_param_shards_to_dtype(self):
+    def _cast_param_shards_to_dtype(self, p: FlatParameter):
         """
         Allocates a mixed precision paramter shard and casts parameter shards to
         reduced precision by copying into this mixed precision shard. Note that
@@ -1490,17 +1495,16 @@ class FullyShardedDataParallel(nn.Module):
             self._mixed_precision_enabled_for_params()
         ), "Expected to only be called when mixed precision for parameters is enabled."
         with torch.cuda.stream(self._streams["mixed_precision_params"]):
-            for p in self.params:
-                assert p._mp_shard is not None
-                _alloc_storage(data=p._mp_shard, size=p._local_shard.size())
-                # Cast is done by copy
-                p._mp_shard.copy_(
-                    # no-op if not CPU offloading, otherwise nonblocking because
-                    # p._local_shard is pinned in _init_param_attributes.
-                    p._local_shard.to(p._mp_shard.device, non_blocking=True)
-                )
-                # Point p to the mp shard
-                p.data = p._mp_shard
+            assert p._mp_shard is not None
+            _alloc_storage(data=p._mp_shard, size=p._local_shard.size())
+            # Cast is done by copy
+            p._mp_shard.copy_(
+                # no-op if not CPU offloading, otherwise nonblocking because
+                # p._local_shard is pinned in _init_param_attributes.
+                p._local_shard.to(p._mp_shard.device, non_blocking=True)
+            )
+            # Point p to the mp shard
+            p.data = p._mp_shard
         # Block current stream on this copy work.
         torch.cuda.current_stream().wait_stream(self._streams["mixed_precision_params"])
 
@@ -2551,7 +2555,7 @@ class FullyShardedDataParallel(nn.Module):
                 currently sharded parameters or ``None`` to not do any
                 unsharding.
             module (nn.Module): Unused; expected by the hook signature.
-            input (Any): Unused; exepcted by the hook signature.
+            input (Any): Unused; expected by the hook signature.
         """
         with torch.autograd.profiler.record_function("FullyShardedDataParallel.forward"):
             self._lazy_init()
@@ -2623,8 +2627,6 @@ class FullyShardedDataParallel(nn.Module):
         Moves the :meth:`forward` inputs to the compute device and casts them
         to the appropriate dtype if needed.
         """
-        if not self._is_root:
-            return (args, kwargs)
         # TODO: Do not use the side stream for tensor copies for now;
         # investigate the perf with/without it
         # TODO: For mixed precision, move the inputs to the compute device and
@@ -2665,7 +2667,8 @@ class FullyShardedDataParallel(nn.Module):
                 free_mp_shard,
             )
             self._pre_forward(self._handles, unused, unshard_fn, unused, unused)
-            args, kwargs = self._cast_forward_inputs(*args, **kwargs)
+            if self._is_root:
+                args, kwargs = self._cast_forward_inputs(*args, **kwargs)
             output = self._fsdp_wrapped_module(*args, **kwargs)
             return self._post_forward(self._handles, reshard_fn, unused, unused, unused, output)
 
@@ -2706,10 +2709,17 @@ class FullyShardedDataParallel(nn.Module):
         self._post_forward_handles.clear()
         for module in self.module.modules():
             module_param_handles = self._module_to_handles[module]
+            # reshard following handles: 1. the handle is in
+            # ``module_param_handles``and 2. the handle doesn't contain
+            # parameters in the parent module of the current module.
+            reshard_handles = []
+            for handle in module_param_handles:
+                if handle._is_root(module):
+                    reshard_handles.append(handle)
             unshard_fn = None
             reshard_fn = functools.partial(
                 self._reshard,
-                [handle.flat_param for handle in module_param_handles],
+                [handle.flat_param for handle in reshard_handles],
                 free_full_params=True,
                 free_mp_shard=self._mixed_precision_enabled_for_params(),
             )
@@ -3560,10 +3570,13 @@ class FullyShardedDataParallel(nn.Module):
                     and not force_full_precision
                 )
                 if mixed_precision_cast_ran:
-                    self._cast_param_shards_to_dtype()
-                    # TODO: remove below
-                    for p in self.params:
-                        assert p.dtype == self.mixed_precision.param_dtype
+                    self._cast_param_shards_to_dtype(p)
+                    p_assert(
+                        p.dtype == self.mixed_precision.param_dtype,
+                        "_rebuild_full_params: Expected full p_data to be "
+                        f"of type {self.mixed_precision.param_dtype}, "
+                        f"but got {p.dtype}!"
+                    )
                 # We can skip moving params to GPU if mixed precision, as p.data
                 # would then be pointing to p._mp_shard which is already on
                 # self.compute_device.

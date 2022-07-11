@@ -526,3 +526,13 @@ class FlatParamHandle:
         return set(pi.module for pi in self.flat_param._param_infos).union(
             set(spi.module for spi in self.flat_param._shared_param_infos)
         )
+
+    def _is_root(self, module: nn.Module) -> bool:
+        """
+        check if the input ``module`` is one of the root modules in
+        ``self._get_modules()``.
+        """
+        for m in self._get_modules():
+            if m is not module and module in list(m.modules()):
+                return False
+        return True

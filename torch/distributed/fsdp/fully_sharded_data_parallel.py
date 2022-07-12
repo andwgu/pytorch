@@ -1092,7 +1092,7 @@ class FullyShardedDataParallel(nn.Module):
         if len(params) == 0:
             return
         handle = FlatParamHandle(params, root_module)
-        for module in handle._get_modules():
+        for module in handle.flat_param._modules:
             self._module_to_handles[module].append(handle)
         self._register_param_handle(handle)
         print(f"[Rank {self.rank}] registered handle for {handle.flat_param._prefixed_param_names}")
@@ -2483,8 +2483,7 @@ class FullyShardedDataParallel(nn.Module):
         """
         params_to_reshard: List[FlatParameter] = []
         for handle in self._handles:
-            is_unsharded = handle.flat_param.size() == handle.flat_param._unsharded_size
-            if handle not in handles and is_unsharded:
+            if handle not in handles and handle._is_unsharded:
                 params_to_reshard.append(handle.flat_param)
         self._reshard(
             params_to_reshard,
@@ -2709,12 +2708,14 @@ class FullyShardedDataParallel(nn.Module):
         self._post_forward_handles.clear()
         for module in self.module.modules():
             module_param_handles = self._module_to_handles[module]
-            # Reshard the handles satisfying:
-            # 1. the handle is in `module_param_handles` and
-            # 2. the handle does not contain parameters in the parent module of `module`.
             handles_to_reshard = []
             for handle in module_param_handles:
-                if handle._is_root(module):
+                # Only allow a handle's root modules to reshard the handle to
+                # avoid early resharding without a subsequent unshard
+                # For multiple root modules, the handle is resharded in each
+                # root module's post-forward, which saves memory but requires
+                # an additional unshard in the next root module's pre-forward
+                if module in handle.flat_param._root_modules:
                     handles_to_reshard.append(handle)
             unshard_fn = None
             reshard_fn = functools.partial(

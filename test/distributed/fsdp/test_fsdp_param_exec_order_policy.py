@@ -77,7 +77,7 @@ class DoubleConv(nn.Module):
         self.conv1 = nn.Conv2d(3, 6, 5)
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(6, 16, 5)
-        # Handles the edge chase when this parameter is wrapped together with
+        # Handles the edge case when this parameter is wrapped together with
         # parameters in the children modules
         self.weight = torch.nn.Parameter(
             torch.randn(16 * 5 * 5, 16 * 5 * 5)
@@ -293,9 +293,10 @@ class TestFSDPExecOrderPolicy(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     @parametrize("iters", [1, 3])
-    def test_fsdp_flatten_params_exec_order(self, iters: int):
+    def test_reconstruct_reverse_gradient_ready_order(self, iters: int):
         """
-        test the execution order of flatten parameters.
+        Tests that ``FlatParameter`` s are reconstructed following reverse gradient
+        ready order after the first iteration.
         """
         model = CNN().cuda()
         group = dist.distributed_c10d._get_default_group()
@@ -348,7 +349,7 @@ class TestFSDPExecOrderPolicy(FSDPTest):
     ])
     def test_fsdp_mixed_precision(self, mp_config: MixedPrecision):
         """
-        test the wrapping with mixed precisions.
+        Tests that ``FlatParameter`` dtypes are expected when using mixed precision.
         """
         model = CNN().cuda()
         group = dist.distributed_c10d._get_default_group()

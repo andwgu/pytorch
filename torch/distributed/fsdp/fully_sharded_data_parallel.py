@@ -2709,17 +2709,17 @@ class FullyShardedDataParallel(nn.Module):
         self._post_forward_handles.clear()
         for module in self.module.modules():
             module_param_handles = self._module_to_handles[module]
-            # reshard following handles: 1. the handle is in
-            # ``module_param_handles``and 2. the handle doesn't contain
-            # parameters in the parent module of the current module.
-            reshard_handles = []
+            # Reshard the handles satisfying:
+            # 1. the handle is in `module_param_handles` and
+            # 2. the handle does not contain parameters in the parent module of `module`.
+            handles_to_reshard = []
             for handle in module_param_handles:
                 if handle._is_root(module):
-                    reshard_handles.append(handle)
+                    handles_to_reshard.append(handle)
             unshard_fn = None
             reshard_fn = functools.partial(
                 self._reshard,
-                [handle.flat_param for handle in reshard_handles],
+                [handle.flat_param for handle in handles_to_reshard],
                 free_full_params=True,
                 free_mp_shard=self._mixed_precision_enabled_for_params(),
             )

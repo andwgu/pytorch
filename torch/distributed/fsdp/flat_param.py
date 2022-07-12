@@ -533,6 +533,7 @@ class FlatParamHandle:
         ``self._get_modules()``.
         """
         for m in self._get_modules():
-            if m is not module and module in list(m.modules()):
+            modules_of_m = set(m.modules())
+            if m is not module and module in modules_of_m:
                 return False
         return True

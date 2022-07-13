@@ -950,37 +950,28 @@ class FullyShardedDataParallel(nn.Module):
 
     def _record_params_wrapper(
         self,
-        params_per_wrapped_module: List[List[nn.Parameter]],
-        traversed_param_set: Set[nn.Parameter],
+        modules_to_wrap: List[nn.Module],
         module: nn.Module,
         **kwargs
         ) -> nn.Module:
         """
-        A ``wrapper_cls`` used in ``wrap._wrap`` to record parameters to
-        be grouped in one FlatParameter without adding a wrapped module to the input
-        ``module``. This is only used in ``ParamExecOrderPolicy``.
+        A ``wrapper_cls`` used in ``wrap._wrap`` to record modules that will be
+        wrapped. This is only used in ``ParamExecOrderPolicy``.
         Args:
-            params_per_wrapped_module (List[List[nn.Parameter]]):
-                used to record the parameters of each wrapped module.
+            modules_to_wrap (List[nn.Module]):
+                used to record modules to be wrapped.
             module (nn.Module): The input module.
             kwargs: other keyword arguments passed in.
         """
-        params = []
-        for p in module.parameters():
-            if p not in traversed_param_set:
-                params.append(p)
-                traversed_param_set.add(p)
-        params_per_wrapped_module.append(params)
+        modules_to_wrap.append(module)
         return module
 
     def _get_params_per_wrapped_module(self, root_module) -> List[List[nn.Parameter]]:
         policy = self.auto_wrap_policy.module_level_group_policy
-        params_per_wrapped_module: List[List[nn.Parameter]] = []
-        traversed_param_set: Set[nn.Parameter] = set()
+        modules_to_wrap: List[nn.Module] = []
         wrapper_cls: Callable = functools.partial(
             self._record_params_wrapper,
-            params_per_wrapped_module,
-            traversed_param_set,
+            modules_to_wrap,
         )
         # TODO (linjianma): do we need to consider ignored_modules and ignored_params?
         _recursive_wrap(
@@ -991,12 +982,33 @@ class FullyShardedDataParallel(nn.Module):
             ignored_params=[],
             only_wrap_children=False,
             )
-        # parameters not wrapped in ``policy`` are grouped together.
-        remaining_params = [
-            p for p in root_module.parameters() if p not in traversed_param_set
-        ]
-        params_per_wrapped_module.append(remaining_params)
-        return params_per_wrapped_module
+        if root_module not in modules_to_wrap:
+            modules_to_wrap.append(root_module)
+
+        params_per_wrap: List[List[nn.Parameter]] = []
+        traversed_params: Set[nn.Parameter] = set()
+        # Modules in `modules_to_wrap` are ordered based on post-order traversal.
+        # We record parameters based on reverse postordering, which is a
+        # topological sort so each shared parameter is guaranteed to be grouped
+        # with its lowest common ancester module's parameters.
+        modules_to_wrap.reverse()
+        for module_to_wrap in modules_to_wrap:
+            # Perform a BFS starting from module, and record all untraversed
+            # parameters that are not the parameter of any other module in
+            # modules_to_wrap.
+            queue: List[nn.Module] = [module_to_wrap]
+            params: List[nn.Parameter] = []
+            while len(queue) > 0:
+                module = queue.pop(0)
+                for p in module.parameters(recurse=False):
+                    if p not in traversed_params:
+                        params.append(p)
+                        traversed_params.add(p)
+                for child in module.children():
+                    if child not in modules_to_wrap:
+                        queue.append(child)
+            params_per_wrap.append(params)
+        return params_per_wrap
 
     def _register_param_handles_from_root_module(self, root_module) -> None:
         """
@@ -3175,7 +3187,12 @@ class FullyShardedDataParallel(nn.Module):
                 and self._param_exec_order_state == ParamExecOrderState.UNINITIALIZED
             ):
                 # In self._handles_exec_order, the handles are ordered based on
-                # the execution order in the backward pass in the first iteration.
+                # the gradient ready order in the backward pass in the first
+                # iteration.
+                # Note: the gradient ready order of `FlatParameter` may not be
+                # consistent with the order of `nn.Parameter` in the original
+                # model, since for each `FlatParameter`, its handle will always
+                # run `_unflatten` in `_pre_forward` before the module forward.
                 self._handles_exec_order.append(self.flat_param_to_handle[param])
 
             if param.grad is None:

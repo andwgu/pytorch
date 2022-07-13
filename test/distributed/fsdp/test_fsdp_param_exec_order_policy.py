@@ -72,37 +72,54 @@ mp_no_mixed_precision = MixedPrecision()
 
 
 class DoubleConv(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, embed) -> None:
         super().__init__()
+        self.embed = embed
         self.conv1 = nn.Conv2d(3, 6, 5)
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(6, 16, 5)
-        # Handles the edge case when this parameter is wrapped together with
+        self.fc = nn.Linear(16 * 5 * 5, 8)
+        # Handles the edge chase when this parameter is wrapped together with
         # parameters in the children modules
         self.weight = torch.nn.Parameter(
             torch.randn(16 * 5 * 5, 16 * 5 * 5)
         )
 
     def forward(self, x):
+        x = self.embed(x)
         x = self.pool(F.relu(self.conv1(x)))
         x = self.pool(F.relu(self.conv2(x)))
         x = torch.flatten(x, 1)
         x = x @ self.weight
+        x = F.relu(self.fc(x))
+        return x
+
+
+class Embedding(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(8, 3 * 32 * 32))
+
+    def forward(self, x):
+        x = x @ self.weight
+        x = x.reshape([4, 3, 32, 32]) # (N, C, H, W)
         return x
 
 
 class CNN(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.conv = DoubleConv()
-        self.fc1 = nn.Linear(16 * 5 * 5, 20)
-        self.fc2 = nn.Linear(20, 20)
-        self.fc3 = nn.Linear(20, 20)
-        self.root_weight = torch.nn.Parameter(torch.randn(20, 20))
+        # test shared module
+        self.shared = Embedding()
+        self.conv1 = DoubleConv(self.shared)
+        self.conv2 = DoubleConv(self.shared)
+        self.fc2 = nn.Linear(8, 8)
+        self.fc3 = nn.Linear(8, 8)
+        self.root_weight = torch.nn.Parameter(torch.randn(8, 8))
 
     def forward(self, x):
-        x = self.conv(x)
-        x = F.relu(self.fc1(x))
+        x = self.conv1(x)
+        x = self.conv2(x)
         x = x @ self.root_weight
         x = F.relu(self.fc3(x))
         x = self.fc2(x)
@@ -110,7 +127,7 @@ class CNN(nn.Module):
 
     @staticmethod
     def get_inp_shape() -> torch.Size:
-        return torch.Size([4, 3, 32, 32])  # (N, C, H, W)
+        return torch.Size([4, 8])
 
 
 class TestFSDPExecOrderPolicy(FSDPTest):
@@ -154,7 +171,7 @@ class TestFSDPExecOrderPolicy(FSDPTest):
                 print(f"[Rank {self.rank}] fsdp names: {[n for n, _ in fsdp_model.named_parameters()]}")
             self.assertEqual(len(fsdp_named_params), len(ref_named_params))
             for (_, p1), (_, p2) in zip(fsdp_named_params, ref_named_params):
-                torch.testing.assert_close(p1, p2, rtol=1e-4, atol=1e-4)
+                torch.testing.assert_close(p1, p2, rtol=1e-2, atol=1e-3)
 
     def _step_model(self, model, inp, optim=None):
         if optim is not None:
@@ -188,7 +205,7 @@ class TestFSDPExecOrderPolicy(FSDPTest):
             ]
             losses.append(iter_losses)
         for l1, l2 in losses:
-            torch.testing.assert_close(l1, l2, rtol=1e-4, atol=1e-4)
+            torch.testing.assert_close(l1, l2, rtol=1e-2, atol=1e-3)
         self._check_fsdp_param_parity(fsdp_model, ref_model)
 
     def _strip_module_prefix(self, optim_state_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -292,6 +309,38 @@ class TestFSDPExecOrderPolicy(FSDPTest):
         )
 
     @skip_if_lt_x_gpu(2)
+    def test_wrap_structure(self):
+        """
+        Tests that ``nn.Parameter`` are corrected grouped as ``FlatParameter``.
+        """
+        model = CNN().cuda()
+        group = dist.distributed_c10d._get_default_group()
+        # Used to test non-default module_level_group_policy
+        module_level_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={DoubleConv, nn.Linear},
+        )
+        param_exec_order_policy = ParamExecOrderPolicy(
+                handle_init_mode=HandleInitMode.MODULE_LEVEL,
+                module_level_group_policy=module_level_policy,
+            )
+        fsdp_model = FSDP(model, group, auto_wrap_policy=param_exec_order_policy)
+        correct_prefixed_param_names = [
+            # here `shared.weight` should be in the same wrap as `root_weight`
+            {'root_weight', 'shared.weight'},
+            {'fc3.weight', 'fc3.bias'},
+            {'fc2.weight', 'fc2.bias'},
+            {'conv2.weight', 'conv2.conv1.weight', 'conv2.conv1.bias', 'conv2.conv2.weight', 'conv2.conv2.bias'},
+            {'conv2.fc.weight', 'conv2.fc.bias'},
+            {'conv1.weight', 'conv1.conv1.weight', 'conv1.conv1.bias', 'conv1.conv2.weight', 'conv1.conv2.bias'},
+            {'conv1.fc.weight', 'conv1.fc.bias'},
+        ]
+        for handle in fsdp_model._handles:
+            self.assertTrue(
+                set(handle.flat_param._prefixed_param_names) in correct_prefixed_param_names
+            )
+
+    @skip_if_lt_x_gpu(2)
     @parametrize("iters", [1, 3])
     def test_reconstruct_reverse_gradient_ready_order(self, iters: int):
         """
@@ -314,11 +363,13 @@ class TestFSDPExecOrderPolicy(FSDPTest):
         self.assertTrue(fsdp_model._param_exec_order_state, ParamExecOrderState.UNINITIALIZED)
         params_list = copy.deepcopy(list(fsdp_model.parameters()))
         (
-            conv_weight,
-            fc1_weight,
-            fc2_weight,
+            root_shared_weight,
             fc3_weight,
-            root_weight,
+            fc2_weight,
+            conv2_weight,
+            conv2_fc_weight,
+            conv1_weight,
+            conv1_fc_weight,
         ) = params_list
         for _ in range(iters):
             inp_shape = CNN.get_inp_shape()
@@ -327,16 +378,14 @@ class TestFSDPExecOrderPolicy(FSDPTest):
             loss = output.sum()
             loss.backward()
         params_exec_order_list = list(fsdp_model.parameters())
-        # Although the forward of root_weight is after conv1_weight, conv2_weight, fc1_weight,
-        # its gradient ready order is still the last (so the forward order recorded is the first),
-        # since for each ``FlatParameter``, its handle will always run ``_unflatten`` in ``_pre_forward``
-        # before the module forward.
         self.assertEqual(
             params_exec_order_list,
             [
-                root_weight,
-                conv_weight,
-                fc1_weight,
+                root_shared_weight,
+                conv1_weight,
+                conv1_fc_weight,
+                conv2_weight,
+                conv2_fc_weight,
                 fc3_weight,
                 fc2_weight,
             ]

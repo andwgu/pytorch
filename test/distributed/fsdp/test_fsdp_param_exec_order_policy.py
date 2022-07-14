@@ -20,16 +20,16 @@ from torch.distributed.fsdp.wrap import (
     HandleInitMode,
     ParamExecOrderPolicy,
     ParamExecOrderState,
-    transformer_auto_wrap_policy
+    transformer_auto_wrap_policy,
 )
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest
 from torch.testing._internal.common_utils import (
-    TEST_WITH_DEV_DBG_ASAN,
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
+    TEST_WITH_DEV_DBG_ASAN,
 )
 
 if not dist.is_available():
@@ -79,7 +79,7 @@ class DoubleConv(nn.Module):
         self.pool = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(6, 16, 5)
         self.fc = nn.Linear(16 * 5 * 5, 8)
-        # Handles the edge chase when this parameter is wrapped together with
+        # Handles the edge case when this parameter is wrapped together with
         # parameters in the children modules
         self.weight = torch.nn.Parameter(
             torch.randn(16 * 5 * 5, 16 * 5 * 5)
@@ -171,7 +171,7 @@ class TestFSDPExecOrderPolicy(FSDPTest):
                 print(f"[Rank {self.rank}] fsdp names: {[n for n, _ in fsdp_model.named_parameters()]}")
             self.assertEqual(len(fsdp_named_params), len(ref_named_params))
             for (_, p1), (_, p2) in zip(fsdp_named_params, ref_named_params):
-                torch.testing.assert_close(p1, p2, rtol=1e-2, atol=1e-3)
+                torch.testing.assert_close(p1, p2, rtol=1e-4, atol=1e-4)
 
     def _step_model(self, model, inp, optim=None):
         if optim is not None:
@@ -205,7 +205,7 @@ class TestFSDPExecOrderPolicy(FSDPTest):
             ]
             losses.append(iter_losses)
         for l1, l2 in losses:
-            torch.testing.assert_close(l1, l2, rtol=1e-2, atol=1e-3)
+            torch.testing.assert_close(l1, l2, rtol=1e-4, atol=1e-4)
         self._check_fsdp_param_parity(fsdp_model, ref_model)
 
     def _strip_module_prefix(self, optim_state_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -311,7 +311,7 @@ class TestFSDPExecOrderPolicy(FSDPTest):
     @skip_if_lt_x_gpu(2)
     def test_wrap_structure(self):
         """
-        Tests that ``nn.Parameter`` are corrected grouped as ``FlatParameter``.
+        Tests that ``nn.Parameter`` are correctly grouped as ``FlatParameter``.
         """
         model = CNN().cuda()
         group = dist.distributed_c10d._get_default_group()
@@ -321,12 +321,14 @@ class TestFSDPExecOrderPolicy(FSDPTest):
             transformer_layer_cls={DoubleConv, nn.Linear},
         )
         param_exec_order_policy = ParamExecOrderPolicy(
-                handle_init_mode=HandleInitMode.MODULE_LEVEL,
-                module_level_group_policy=module_level_policy,
-            )
+            handle_init_mode=HandleInitMode.MODULE_LEVEL,
+            module_level_group_policy=module_level_policy,
+        )
         fsdp_model = FSDP(model, group, auto_wrap_policy=param_exec_order_policy)
         correct_prefixed_param_names = [
             # here `shared.weight` should be in the same wrap as `root_weight`
+            # because the root module `model` is the lowest common ancestor
+            # of the modules `conv1` and `conv2` that share `shared.weight`.
             {'root_weight', 'shared.weight'},
             {'fc3.weight', 'fc3.bias'},
             {'fc2.weight', 'fc2.bias'},
@@ -336,9 +338,11 @@ class TestFSDPExecOrderPolicy(FSDPTest):
             {'conv1.fc.weight', 'conv1.fc.bias'},
         ]
         for handle in fsdp_model._handles:
-            self.assertTrue(
-                set(handle.flat_param._prefixed_param_names) in correct_prefixed_param_names
+            self.assertIn(
+                set(handle.flat_param._prefixed_param_names),
+                correct_prefixed_param_names,
             )
+        self.assertEqual(len(fsdp_model._handles), len(correct_prefixed_param_names))
 
     @skip_if_lt_x_gpu(2)
     @parametrize("iters", [1, 3])
@@ -355,9 +359,9 @@ class TestFSDPExecOrderPolicy(FSDPTest):
             transformer_layer_cls={DoubleConv, nn.Linear},
         )
         param_exec_order_policy = ParamExecOrderPolicy(
-                handle_init_mode=HandleInitMode.MODULE_LEVEL,
-                module_level_group_policy=module_level_policy,
-            )
+            handle_init_mode=HandleInitMode.MODULE_LEVEL,
+            module_level_group_policy=module_level_policy,
+        )
         fsdp_model = FSDP(model, group, auto_wrap_policy=param_exec_order_policy)
         self.assertTrue(fsdp_model._use_param_exec_order_policy)
         self.assertTrue(fsdp_model._param_exec_order_state, ParamExecOrderState.UNINITIALIZED)
@@ -408,15 +412,15 @@ class TestFSDPExecOrderPolicy(FSDPTest):
             transformer_layer_cls={DoubleConv, nn.Linear},
         )
         param_exec_order_policy = ParamExecOrderPolicy(
-                handle_init_mode=HandleInitMode.MODULE_LEVEL,
-                module_level_group_policy=module_level_policy,
-            )
+            handle_init_mode=HandleInitMode.MODULE_LEVEL,
+            module_level_group_policy=module_level_policy,
+        )
         fsdp_model = FSDP(
             model,
             group,
             auto_wrap_policy=param_exec_order_policy,
             mixed_precision=mp_config,
-            )
+        )
         inp_shape = CNN.get_inp_shape()
         input = torch.randn(inp_shape).to(self.rank)
         output = fsdp_model(input)

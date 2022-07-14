@@ -363,6 +363,7 @@ def _recursive_wrap(
     """
     Automatically wrap child modules of *module* that meet the given
     criteria with :func:`auto_wrap`. Does not rely on _ConfigAutoWrap.
+    `module` is wrapped based on a post-order traversal.
     Args:
         module (nn.Module):
             module to recursively wrap

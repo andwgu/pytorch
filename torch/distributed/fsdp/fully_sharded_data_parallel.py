@@ -982,20 +982,22 @@ class FullyShardedDataParallel(nn.Module):
             ignored_params=[],
             only_wrap_children=False,
             )
+        # Used when `root_module` is not wrapped in `_recursive_wrap`.
         if root_module not in modules_to_wrap:
             modules_to_wrap.append(root_module)
 
         params_per_wrap: List[List[nn.Parameter]] = []
         traversed_params: Set[nn.Parameter] = set()
-        # Modules in `modules_to_wrap` are ordered based on post-order traversal.
-        # We record parameters based on reverse postordering, which is a
-        # topological sort so each shared parameter is guaranteed to be grouped
-        # with its lowest common ancester module's parameters.
+        # Constructing `modules_to_wrap` with `_recursive_wrap` orders the
+        # modules based on a post-order traversal. We record parameters based on
+        # reverse postordering, which is a topological sort so each shared
+        # parameter is guaranteed to be grouped with its lowest common ancestor
+        # module's parameters.
         modules_to_wrap.reverse()
         for module_to_wrap in modules_to_wrap:
-            # Perform a BFS starting from module, and record all untraversed
+            # Perform a BFS starting from `module_to_wrap`, and record all untraversed
             # parameters that are not the parameter of any other module in
-            # modules_to_wrap.
+            # `modules_to_wrap`.
             queue: List[nn.Module] = [module_to_wrap]
             params: List[nn.Parameter] = []
             while len(queue) > 0:
@@ -3190,9 +3192,10 @@ class FullyShardedDataParallel(nn.Module):
                 # the gradient ready order in the backward pass in the first
                 # iteration.
                 # Note: the gradient ready order of `FlatParameter` may not be
-                # consistent with the order of `nn.Parameter` in the original
-                # model, since for each `FlatParameter`, its handle will always
-                # run `_unflatten` in `_pre_forward` before the module forward.
+                # consistent with the execution order of `nn.Parameter` in the
+                # original model, since for each `FlatParameter`, its handle
+                # will always run `_unflatten` in `_pre_forward` before the
+                # module forward.
                 self._handles_exec_order.append(self.flat_param_to_handle[param])
 
             if param.grad is None:

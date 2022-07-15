@@ -195,7 +195,7 @@ class FlatParameter(nn.Parameter):
                 )
                 if is_child_module:
                     is_root_module = False
-                    continue
+                    break
             if is_root_module:
                 root_modules.add(candidate_module)
         return root_modules

@@ -1019,9 +1019,9 @@ class FullyShardedDataParallel(nn.Module):
             _fsdp_wrapped_module (nn.Module): Top-level root module passed into
                 the :class:`FullyShardedDataParallel` constructor.
             _module_to_handles (Dict[nn.Module, List[FlatParamHandle]]):
-                Mapping from `module` to the :class:`FlatParamHandle` s whose
-                :class:`FlatParameter` will be resharded and unsharded in the
-                forward hooks of `module.`
+                Mapping from each module to the :class:`FlatParamHandle` s whose
+                :class:`FlatParameter` will be unsharded and resharded in the
+                pre- and post-forward hooks of the module, respectively.
 
         This should only be called once during FSDP initialization.
 
@@ -1138,7 +1138,6 @@ class FullyShardedDataParallel(nn.Module):
         self._deregister_flat_params()
         self._handles.clear()
         self.params.clear()
-        self._module_to_handles = collections.defaultdict(list)
         # TODO (awgu): reconstruct gradients as well
         for old_handles in handles_per_flat_param:
             prefixed_param_names: List[str] = []
@@ -1171,32 +1170,34 @@ class FullyShardedDataParallel(nn.Module):
 
     def _construct_module_to_handles(self) -> None:
         """
-        This constructs ``_module_to_handles`` based on ``_handles``. For each
-        `handle`, its `module` is chosen as the lowest common ancestor that
-        includes all unflatten parameters included in this `handle.`
+        This constructs ``self._module_to_handles`` based on ``self._handles``.
+        For each handle, its module is chosen to be the lowest common ancestor
+        whose subtree includes all original parameters in the handle.
         """
-        module_to_parent : Dict[nn.Module, nn.Module] = dict()
+        self._module_to_handles.clear()
+        module_to_parent: Dict[nn.Module, nn.Module] = dict()
         for module in self.module.modules():
             for child in module.children():
                 module_to_parent[child] = module
         for handle in self._handles:
             roots = list(handle.flat_param._root_modules)
-            assert (
-                len(roots) > 0
-            ), "Number of root modules in handle.flat_param should be at least 1"
+            p_assert(
+                len(roots) > 0,
+                "Number of root modules in `handle.flat_param` should be at least 1",
+            )
             lowest_common_ancestor = roots[0]
-            # Note that we can't use an instance of `nn.ModuleList` to schedule
-            # `handle`, since `nn.ModuleList` doesn't have a `forward` function
-            # and hooks cannot be added there.
+            # We cannot use an `nn.ModuleList` to schedule handle since it does
+            # not have a `forward()` method needed to register hooks
             while (
                 not set(roots).issubset(set(lowest_common_ancestor.modules()))
                 or isinstance(lowest_common_ancestor, nn.ModuleList)
             ):
                 lowest_common_ancestor = module_to_parent[lowest_common_ancestor]
-            if lowest_common_ancestor not in self._module_to_handles:
-                self._module_to_handles[lowest_common_ancestor] = [handle]
-            else:
-                self._module_to_handles[lowest_common_ancestor].append(handle)
+            self._module_to_handles[lowest_common_ancestor].append(handle)
+        p_assert(
+            sum(len(v) for v in self._module_to_handles.values()) == len(self._handles),
+            "Every handle should only map to a single module",
+        )
 
     def _move_module_if_needed(self, module) -> None:
         """
@@ -2689,8 +2690,8 @@ class FullyShardedDataParallel(nn.Module):
         wrapping path, they are registered as hooks on every (sub)module.
         """
         self._lazy_init()
-        self._wait_for_previous_optim_step()
         with torch.autograd.profiler.record_function("FullyShardedDataParallel.forward"):
+            self._wait_for_previous_optim_step()
             # Non-recursive wrapping path (using hooks)
             if self._use_param_exec_order_policy:
                 args, kwargs = self._cast_forward_inputs(*args, **kwargs)
@@ -2726,7 +2727,6 @@ class FullyShardedDataParallel(nn.Module):
         for forward_handle in self._pre_forward_handles:
             forward_handle.remove()
         self._pre_forward_handles.clear()
-
         for module in self.module.modules():
             if module in self._module_to_handles:
                 reshard_fn = None

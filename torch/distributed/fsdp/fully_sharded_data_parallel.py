@@ -1159,6 +1159,14 @@ class FullyShardedDataParallel(nn.Module):
                 prefixed_param_names.extend(old_handle.flat_param._prefixed_param_names)
                 flat_params.append(old_handle.flat_param)
             self._rebuild_full_params(flat_params)
+            # For each parameter in `flat_params`, its sharded tensors will
+            # not be used anymore. We explicitly free their storage for better
+            # memory efficiency.
+            for flat_param in flat_params:
+                if hasattr(flat_param, "_local_shard"):
+                    _free_storage(flat_param._local_shard)
+                if hasattr(flat_param, "_mp_shard"):
+                    _free_storage(flat_param._mp_shard)
             torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
             with contextlib.ExitStack() as stack:
                 for ctx in (old_handle.unflatten_as_params() for old_handle in old_handles):
@@ -1171,6 +1179,11 @@ class FullyShardedDataParallel(nn.Module):
                     self._register_param_handle_from_params(orig_params, self._fsdp_wrapped_module)
                 )
                 stack.close()
+                # For each parameter in `orig_params`, its data will not be used
+                # anymore. We explicitly free the storage for better memory
+                # efficiency.
+                for p in orig_params:
+                    _free_storage(p.data)
             self.params.append(new_handle.flat_param)
             self._shard_parameters([new_handle])
         for flat_param in self.params:

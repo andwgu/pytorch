@@ -1,6 +1,9 @@
-import torch
+import pdb
+import sys
 import warnings
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import torch
 
 __all__ = [
     "checkpoint", "checkpoint_sequential", "CheckpointFunction",
@@ -313,6 +316,11 @@ def checkpoint_sequential(functions, segments, input, **kwargs):
                            preserve_rng_state=preserve)
     return run_function(end + 1, len(functions) - 1, functions)(input)
 
+
+class StopRecompException(Exception):
+    pass
+
+
 def _checkpoint_without_reentrant(function, preserve_rng_state=True, *args, **kwargs):
     """Checkpointining without re-entrant autograd
     Args:
@@ -341,50 +349,70 @@ def _checkpoint_without_reentrant(function, preserve_rng_state=True, *args, **kw
             fwd_gpu_devices, fwd_gpu_states = get_device_states(*args)
 
     storage: Dict[int, Optional[torch.Tensor]] = {}
+    pdb.set_trace()
     counter = 0
 
     def pack(x):
         nonlocal counter
+        print(f"[pack()] x shape={x.shape} id={id(x)} refcount={sys.getrefcount(x)-1} counter={counter}")
         counter += 1
         # TODO(varal7): Instead of returning indices, we can return things metadata (such as
         # size, device, ...) to catch certain cases of undeterministic behavior of the forward
         return counter - 1
 
     def unpack(x):
-        unpack_counter = 0
+        def recompute_forward(target_index=None):
+            print(f"[unpack()] x={x} len(storage)={len(storage)}")
+            unpack_counter = 0
+
+            if len(storage) == 0 or x not in storage:
+
+                def inner_pack(inner):
+                    print(f"[inner_pack()] inner shape={inner.shape} id={id(inner)} refcount={sys.getrefcount(inner)-1}")
+                    nonlocal unpack_counter
+                    storage[unpack_counter] = inner
+                    if target_index is not None and unpack_counter == target_index:
+                        raise StopRecompException()
+                    unpack_counter += 1
+                    return None
+
+                def inner_unpack(packed):
+                    raise RuntimeError("You are calling backwards on a tensor that is never exposed. Please open an issue.")
+
+                # Stash the surrounding rng state, and mimic the state that was
+                # present at this time during forward.  Restore the surrounding state
+                # when we're done.
+                rng_devices = []
+                if preserve_rng_state and had_cuda_in_fwd:
+                    rng_devices = fwd_gpu_devices
+                with torch.random.fork_rng(devices=rng_devices, enabled=preserve_rng_state):
+                    if preserve_rng_state:
+                        torch.set_rng_state(fwd_cpu_state)
+                        if had_cuda_in_fwd:
+                            set_device_states(fwd_gpu_devices, fwd_gpu_states)
+                    with torch.enable_grad(), torch.cuda.amp.autocast(had_autocast_in_fwd):
+                        with torch.autograd.graph.saved_tensors_hooks(inner_pack, inner_unpack):
+                            _unused = function(*args, **kwargs)
         if len(storage) == 0:
-
-            def inner_pack(inner):
-                nonlocal unpack_counter
-                storage[unpack_counter] = inner
-                unpack_counter += 1
-                return None
-
-            def inner_unpack(packed):
-                raise RuntimeError("You are calling backwards on a tensor that is never exposed. Please open an issue.")
-
-            # Stash the surrounding rng state, and mimic the state that was
-            # present at this time during forward.  Restore the surrounding state
-            # when we're done.
-            rng_devices = []
-            if preserve_rng_state and had_cuda_in_fwd:
-                rng_devices = fwd_gpu_devices
-            with torch.random.fork_rng(devices=rng_devices, enabled=preserve_rng_state):
-                if preserve_rng_state:
-                    torch.set_rng_state(fwd_cpu_state)
-                    if had_cuda_in_fwd:
-                        set_device_states(fwd_gpu_devices, fwd_gpu_states)
-                with torch.enable_grad(), torch.cuda.amp.autocast(had_autocast_in_fwd):
-                    with torch.autograd.graph.saved_tensors_hooks(inner_pack, inner_unpack):
-                        _unused = function(*args, **kwargs)
-
+            recompute_forward()
         if x not in storage:
-            raise RuntimeError(
-                "Attempt to retrieve a tensor saved by autograd multiple times without checkpoint"
-                " recomputation being triggered in between, this is not currently supported. Please"
-                " open an issue with details on your use case so that we can prioritize adding this."
-            )
+            try:
+                recompute_forward(target_index=x)
+            except RuntimeError as e:
+                if e.args and isinstance(e.args[0], str) and e.args[0].startswith("StopRecompException"):
+                    pass
+                else:
+                    raise e
 
+        # if x not in storage:
+        #     raise RuntimeError(
+        #         "Attempt to retrieve a tensor saved by autograd multiple times without checkpoint"
+        #         " recomputation being triggered in between, this is not currently supported. Please"
+        #         " open an issue with details on your use case so that we can prioritize adding this."
+        #     )
+
+        print(f"[unpack()] pop x={x} refcount={sys.getrefcount(storage[x])-1}")
+        print(f"[unpack()] storage refcount={sys.getrefcount(storage)-1}")
         return storage.pop(x)
 
     with torch.autograd.graph.saved_tensors_hooks(pack, unpack):

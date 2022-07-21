@@ -349,7 +349,7 @@ def _checkpoint_without_reentrant(function, preserve_rng_state=True, *args, **kw
             fwd_gpu_devices, fwd_gpu_states = get_device_states(*args)
 
     storage: Dict[int, Optional[torch.Tensor]] = {}
-    pdb.set_trace()
+    # pdb.set_trace()
     counter = 0
 
     def pack(x):
@@ -368,7 +368,7 @@ def _checkpoint_without_reentrant(function, preserve_rng_state=True, *args, **kw
             if len(storage) == 0 or x not in storage:
 
                 def inner_pack(inner):
-                    print(f"[inner_pack()] inner shape={inner.shape} id={id(inner)} refcount={sys.getrefcount(inner)-1}")
+                    print(f"[inner_pack()] inner shape={inner.shape} id={id(inner)} refcount={sys.getrefcount(inner)-1} {inner}")
                     nonlocal unpack_counter
                     storage[unpack_counter] = inner
                     if target_index is not None and unpack_counter == target_index:
@@ -396,13 +396,13 @@ def _checkpoint_without_reentrant(function, preserve_rng_state=True, *args, **kw
         if len(storage) == 0:
             recompute_forward()
         if x not in storage:
-            try:
-                recompute_forward(target_index=x)
-            except RuntimeError as e:
-                if e.args and isinstance(e.args[0], str) and e.args[0].startswith("StopRecompException"):
-                    pass
-                else:
-                    raise e
+            # try:
+            recompute_forward(target_index=x)
+            # except RuntimeError as e:
+            #     if e.args and isinstance(e.args[0], str) and e.args[0].startswith("StopRecompException"):
+            #         pass
+            #     else:
+            #         raise e
 
         # if x not in storage:
         #     raise RuntimeError(

@@ -46,13 +46,14 @@ def get_tensors(only_cuda=False, omit_objs=[]):
 
 def grad_hook(name, *args, **kwargs):
     print(f"grad hook for {name}!")
-    pdb.set_trace()
+    # pdb.set_trace()
 
 
 class Model(torch.nn.Module):
     def __init__(self, in_dim, out_dim) -> None:
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.randn(in_dim, out_dim))
+        self.weight1 = torch.nn.Parameter(torch.randn(in_dim, out_dim))
+        self.weight2 = torch.nn.Parameter(torch.randn(in_dim, out_dim))
         self.gelu = torch.nn.GELU()
 
     def forward(self, inp):
@@ -64,11 +65,13 @@ class Model(torch.nn.Module):
             Tensor: (BATCH_SIZE, OUT_DIM)
         """
         print(f"Model.forward()!")
-        lin_out = inp @ self.weight    # activation: `inp`
-        lin_out.register_hook(functools.partial(grad_hook, "lin_out"))
-        print(f"[lin_out] shape={lin_out.shape} id={id(lin_out)} refcount={sys.getrefcount(lin_out)-1}")
-        gelu_out = self.gelu(lin_out)  # activation: `lin_out`
-        return gelu_out
+        lin_out1 = inp @ self.weight1    # activation: `inp`
+        lin_out2 = inp @ self.weight2    # activation: `inp`
+        return lin_out1 + lin_out2
+        # lin_out.register_hook(functools.partial(grad_hook, "lin_out"))
+        # print(f"[lin_out] shape={lin_out.shape} id={id(lin_out)} refcount={sys.getrefcount(lin_out)-1}")
+        # gelu_out = self.gelu(lin_out)  # activation: `lin_out`
+        # return gelu_out
 
 
 # torch.cuda.set_device(0)
@@ -82,13 +85,14 @@ inp = torch.randn((BATCH_SIZE, IN_DIM), device=torch.device("cpu"))
 print(" Init ".center(80, '*'))
 print(f"[inp]    shape={inp.shape} id={id(inp)}")
 # print(f"[weight] shape={model.weight.shape} id={id(model.weight)}")
-print(f"[weight] shape={model[0].weight.shape} id={id(model[0].weight)}")
+print(f"[weight1] shape={model[0].weight1.shape} id={id(model[0].weight1)}")
+print(f"[weight2] shape={model[0].weight2.shape} id={id(model[0].weight2)}")
 print(" Forward ".center(80, '*'))
 out = model(inp).sum()
 out.register_hook(functools.partial(grad_hook, "out"))
 # model.weight.register_hook(functools.partial(grad_hook, "weight"))
-model[0].weight.register_hook(functools.partial(grad_hook, "0.weight"))
-model[1].weight.register_hook(functools.partial(grad_hook, "1.weight"))
+# model[0].weight.register_hook(functools.partial(grad_hook, "0.weight"))
+# model[1].weight.register_hook(functools.partial(grad_hook, "1.weight"))
 for tensor in get_tensors():
     print(f"shape={tensor.shape} id={id(tensor)}")
 print(" Backward ".center(80, '*'))

@@ -215,7 +215,7 @@ class TransformerWithSharedParams(FSDPTestModel):
         self.rank = group.rank()
         self.world_size = group.size()
         if deterministic:
-            torch.manual_seed(0)
+            torch.manual_seed(3)
         d_vocab = 23
         d_model = 16
 
@@ -891,6 +891,7 @@ class FSDPTest(MultiProcessTestCase):
         backward_prefetch: Optional[BackwardPrefetch] = None,
         forward_prefetch: bool = False,
         sharding_strategy: Optional[ShardingStrategy] = None,
+        use_orig_params: bool = False,
         mixed_precision: Optional[MixedPrecision] = None,
         enable_sharded_grad_scaler: bool = False,
         use_pure_fp16: bool = False,
@@ -951,6 +952,7 @@ class FSDPTest(MultiProcessTestCase):
                 "forward_prefetch": forward_prefetch,
                 "sharding_strategy": sharding_strategy,
                 "mixed_precision": mixed_precision,
+                "use_orig_params": use_orig_params,
             }
         )
         try:

@@ -883,6 +883,9 @@ class FullyShardedDataParallel(nn.Module):
             self.flat_param_to_handle: Dict[FlatParameter, FlatParamHandle] = dict()
             for handle in self._handles:
                 self.flat_param_to_handle[handle.flat_param] = handle
+            # In each forward pass of `self`, `self._handle_is_unflattened`
+            # denotes whether the `flat_param` of a handle has been unflattened.
+            self._handle_is_unflattened: Dict[FlatParamHandle, bool] = dict()
         else:
             self._fsdp_wrapped_module = FlattenParamsWrapper(module, params)
             self.params: List[FlatParameter] = []
@@ -1158,6 +1161,7 @@ class FullyShardedDataParallel(nn.Module):
                 following that :class:`list` order.
         """
         print(f"[Rank {self.rank}] reconstructing handles")
+        self._handle_is_unflattened.clear()
         # TODO (awgu): check each handle appears exactly once in the list of lists
         self._deregister_flat_params()
         self._handles.clear()
@@ -2696,7 +2700,9 @@ class FullyShardedDataParallel(nn.Module):
                 unshard_fn()
             if self._use_param_exec_order_policy:
                 for handle in handles:
-                    handle._unflatten(as_params=False)
+                    if not self._handle_is_unflattened[handle]:
+                        handle._unflatten(as_params=False)
+                        self._handle_is_unflattened[handle] = True
             # Register post-backward hooks to reshard the parameters and
             # reduce-scatter their gradients. They must be re-registered every
             # forward pass in case the `grad_fn` is mutated.
@@ -2776,6 +2782,9 @@ class FullyShardedDataParallel(nn.Module):
         and post-forward are called explicitly, while for the non-recursive-
         wrapping path, they are registered as hooks on every (sub)module.
         """
+        if hasattr(self, "_handle_is_unflattened"):
+            for handle in self._handles:
+                self._handle_is_unflattened[handle] = False
         self._lazy_init()
         with torch.autograd.profiler.record_function("FullyShardedDataParallel.forward"):
             self._wait_for_previous_optim_step()

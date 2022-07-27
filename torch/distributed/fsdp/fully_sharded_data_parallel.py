@@ -2689,7 +2689,12 @@ class FullyShardedDataParallel(nn.Module):
             input (Any): Unused; expected by the hook signature.
         """
         with torch.autograd.profiler.record_function("FullyShardedDataParallel.forward"):
-            self.training_state = TrainingState_.FORWARD
+            if self.training_state in [TrainingState_.IDLE, TrainingState_.FORWARD]:
+                # Only change `self.training_state` to `TrainingState_.FORWARD`
+                # within a forward pass. Within a backward pass, `_pre_forward`
+                # can still be triggered with activation checkpointing, in which
+                # case we don't change `self.training_state`.
+                self.training_state = TrainingState_.FORWARD
             if reshard_fn is not None:
                 reshard_fn()
             if unshard_fn is not None:
@@ -2697,10 +2702,11 @@ class FullyShardedDataParallel(nn.Module):
             if self._use_param_exec_order_policy:
                 for handle in handles:
                     handle._unflatten(as_params=False)
-            # Register post-backward hooks to reshard the parameters and
-            # reduce-scatter their gradients. They must be re-registered every
-            # forward pass in case the `grad_fn` is mutated.
-            self._register_post_backward_hooks([handle.flat_param for handle in handles])
+            if self.training_state in [TrainingState_.IDLE, TrainingState_.FORWARD]:
+                # Register post-backward hooks to reshard the parameters and
+                # reduce-scatter their gradients. They must be re-registered every
+                # forward pass in case the `grad_fn` is mutated.
+                self._register_post_backward_hooks([handle.flat_param for handle in handles])
 
     def _post_forward(
         self,
@@ -2737,6 +2743,12 @@ class FullyShardedDataParallel(nn.Module):
         that, after the first forward, the optimizer state is initialized
         according to the sharded flattened parameter's dtype and shape.
         """
+        if self.training_state in [TrainingState_.BACKWARD_PRE, TrainingState_.BACKWARD_POST]:
+            # Within a backward pass, `_post_forward` can still be triggered
+            # with activation checkpointing, in which case we directly return
+            # `output` and don't run `reshard_fn` and
+            # `self._register_pre_backward_hooks`. This avoids early resharding.
+            return output
         with torch.autograd.profiler.record_function("FullyShardedDataParallel.forward"):
             if self not in self._fsdp_graph_order:
                 self._my_fsdp_idx_in_graph = len(self._fsdp_graph_order)

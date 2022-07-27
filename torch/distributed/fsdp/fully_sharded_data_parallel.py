@@ -889,11 +889,10 @@ class FullyShardedDataParallel(nn.Module):
             if self._fsdp_wrapped_module.has_params:
                 self.params.append(self._fsdp_wrapped_module.flat_param)
                 self._register_param_handle(self._fsdp_wrapped_module.handle)
+            # Shard module parameters in place
+            self._shard_parameters(self._handles)
 
         assert getattr(self, FSDP_WRAPPED_MODULE) is self._fsdp_wrapped_module
-
-        # Shard module parameters in place
-        self._shard_parameters(self._handles)
 
         # Check that the sharding logic was applied to all parameters by
         # checking that the original module parameters have been replaced by
@@ -1133,6 +1132,8 @@ class FullyShardedDataParallel(nn.Module):
         handle = FlatParamHandle(params, root_module)
         self._register_param_handle(handle)
         print(f"[Rank {self.rank}] registered handle for {handle.flat_param._prefixed_param_names}")
+        # Shard handle flat_params in place
+        self._shard_parameters([handle])
         return handle
 
     def _register_param_handles_from_handles(
@@ -1175,6 +1176,8 @@ class FullyShardedDataParallel(nn.Module):
             # memory efficiency.
             for flat_param in flat_params:
                 self._free_sharded_param_attributes(flat_param)
+                # synchronize to reduce memory usage
+                torch.cuda.current_stream().synchronize()
             torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
             with contextlib.ExitStack() as stack:
                 for ctx in (old_handle.unflatten_as_params() for old_handle in old_handles):
@@ -1192,8 +1195,8 @@ class FullyShardedDataParallel(nn.Module):
                 # efficiency.
                 for p in orig_params:
                     _free_storage(p)
+                    torch.cuda.current_stream().synchronize()
             self.params.append(new_handle.flat_param)
-            self._shard_parameters([new_handle])
         for flat_param in self.params:
             self._init_param_attributes(flat_param)
         self._register_flat_params()
@@ -4625,6 +4628,9 @@ def _free_storage(data: torch.Tensor) -> None:
             data.storage_offset() == 0
         ), "The tensor is not the sole occupant of the storage."
         data.storage().resize_(0)  # type: ignore[attr-defined]
+        # TODO: `synchronize` is useful in reducing memory usage for running
+        # large models on multiple nodes.
+        torch.cuda.current_stream().synchronize()
 
 
 @torch.no_grad()

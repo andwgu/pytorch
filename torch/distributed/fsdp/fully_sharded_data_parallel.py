@@ -804,8 +804,12 @@ class FullyShardedDataParallel(nn.Module):
                 f"FSDP only supports single device modules, but got params on {module_devices}"
             )
 
-        # Move module appropriately depending on device_id and whether module is on CPU.
-        self._move_module_if_needed(module)
+        # For `ParamExecOrderPolicy`, we delay the step of moving parameters to
+        # GPU to `self._register_param_handle_from_params`, which avoids moving
+        # the whole module parameters to GPU without sharding.
+        if not self._use_param_exec_order_policy:
+            # Move module appropriately depending on device_id and whether module is on CPU.
+            self._move_module_if_needed(module)
 
         # device for computation, if module is on GPU, use module.device;
         # if module is on CPU, use current device;
@@ -1130,6 +1134,7 @@ class FullyShardedDataParallel(nn.Module):
         """
         if len(params) == 0:
             return
+        self._move_params_if_needed(params)
         handle = FlatParamHandle(params, root_module)
         self._register_param_handle(handle)
         print(f"[Rank {self.rank}] registered handle for {handle.flat_param._prefixed_param_names}")
@@ -1236,9 +1241,7 @@ class FullyShardedDataParallel(nn.Module):
     def _move_module_if_needed(self, module) -> None:
         """
         Moves module appropriately depending on device_id and
-        whether module is on CPU. Returns a ``bool`` indicating
-        whether the module needs to be moved back to CPU before
-        returning to user.
+        whether module is on CPU.
         """
         # Move module to device specified. Note that this is done prior to
         # setting compute_device to ensure that they align.
@@ -1288,6 +1291,16 @@ class FullyShardedDataParallel(nn.Module):
             except StopIteration:
                 # this FSDP instance manages no parameters
                 pass
+
+    def _move_params_if_needed(self, params: List[nn.Parameter]) -> None:
+        """
+        Moves `params` appropriately depending on `device_id` and
+        whether `p` of `params` is on CPU.
+        """
+        assert self.device_id is not None
+        for p in params:
+            if p.device == torch.device("cpu"):
+                p = p.to(self.device_id)
 
     def _init_reshard_after_forward(self):
         # TODO (awgu): `reshard_after_forward` is not used for non-recursive

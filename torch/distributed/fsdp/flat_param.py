@@ -590,8 +590,3 @@ class FlatParamHandle:
             self.flat_param._numels[sl],
             self.flat_param._shard_param_offsets[:],  # type: ignore[attr-defined]
         )
-
-    @property
-    def _is_unsharded(self) -> bool:
-        """Returns if the handle's ``FlatParameter`` is currently unsharded."""
-        return self.flat_param.size() == self.flat_param._unsharded_size

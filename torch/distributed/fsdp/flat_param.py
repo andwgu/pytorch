@@ -354,6 +354,7 @@ class FlatParamHandle:
         self._training_state = HandleTrainingState.IDLE
         self._debug_level = dist.get_debug_level()
         self._comm_module = comm_module
+        self._ran_flat_param_pre_backward_hook = False
         self._init_flat_param(params, module, use_orig_params)
         self._use_unsharded_views(as_params=False)
 
@@ -1033,11 +1034,16 @@ class FlatParamHandle:
         self.flat_param.grad = self.flat_param._saved_grad_shard  # type: ignore[attr-defined]
         delattr(self.flat_param, "_saved_grad_shard")
 
+    @no_type_check
     def prepare_gradient_for_backward(self):
         """
         Prepares the gradient for the backward computation by saving and
         clearing any existing sharded gradient in ``.grad`` to enable computing
         a new unsharded gradient.
+
+        Args:
+            sync_gradients (bool): ``False`` if in ``no_sync()`` and ``True``
+                otherwise.
         """
         p_assert(
             self._training_state
@@ -1045,16 +1051,25 @@ class FlatParamHandle:
             "Expects to be in `BACKWARD_PRE` or `IDLE` (if prefetching)",
         )
         flat_param = self.flat_param
-        if flat_param.grad is not None and (
-            flat_param.grad.size() != flat_param._unpadded_unsharded_size
-            or flat_param.grad.device != flat_param.device  # grad on CPU
-        ):
+        has_grad = flat_param.grad is not None
+        has_grad_and_not_in_no_sync = (
+            has_grad and flat_param.grad.size() != flat_param._unpadded_unsharded_size
+        )
+        has_grad_and_in_no_sync = (
+            has_grad
+            and flat_param.grad.size() == flat_param._unpadded_unsharded_size
+            and flat_param.grad.size() != flat_param._sharded_size
+        )
+        has_grad_and_cpu_offloading = (
+            has_grad and flat_param.grad.device != flat_param.device
+        )  # grad on CPU
+        if has_grad_and_not_in_no_sync or has_grad_and_cpu_offloading:
             self._check_on_compute_device(self.flat_param)
             grad_offloaded = flat_param.grad.device != self.device
             p_assert(
                 not grad_offloaded or self._config.offload_params,
-                f"Expects the sharded gradient to be on {self.device} "
-                f"but got {flat_param.grad.device}",
+                f"Expects the sharded gradient to be on {self.device} but got "
+                f"{flat_param.grad.device}",
             )
             prev_iter_synced_gradients = (
                 flat_param.grad.size()
@@ -1097,6 +1112,31 @@ class FlatParamHandle:
                     f"but got size {flat_param.grad.size()}",
                 )
             flat_param.grad = None
+        # If the unsharded gradient needs padding, then pre-allocate the padded
+        # unsharded gradient to avoid an allocation and D2D copy in the
+        # post-backward hook. If it does not need padding, then let the
+        # autograd engine construct the gradient normally to avoid an
+        # unnecessary allocation.
+        if self._needs_padding and not has_grad_and_in_no_sync:
+            p_assert(
+                not hasattr(flat_param, "_padded_unsharded_grad"),
+                f"{self} already has `_padded_unsharded_grad` on rank {self.rank}",
+            )
+            flat_param._padded_unsharded_grad = (  # type: ignore[attr-defined]
+                torch.zeros_like(flat_param._full_param_padded)  # type: ignore[attr-defined]
+                if self.uses_sharded_strategy
+                else torch.zeros_like(flat_param)
+            )
+            p_assert(
+                flat_param.size() == flat_param._unpadded_unsharded_size,
+                "Expects `flat_param` to have unpadded unsharded size "
+                f"{flat_param._unpadded_unsharded_size} but got {flat_param.size()}",
+            )
+            # Set the unpadded unsharded gradient to be a view into the padded one,
+            # which owns the storage
+            flat_param.grad = flat_param._padded_unsharded_grad[  # type: ignore[attr-defined]
+                : flat_param._unpadded_unsharded_size.numel()  # type: ignore[attr-defined]
+            ]
 
     def prepare_gradient_for_optim(self):
         """
@@ -1946,6 +1986,13 @@ class FlatParamHandle:
         return (
             self._training_state == HandleTrainingState.SUMMON_FULL_PARAMS
             and self._uses_param_mixed_precision
+        )
+
+    @property
+    def _needs_padding(self) -> bool:
+        return (
+            self.uses_sharded_strategy
+            and self.flat_param._padded_unsharded_size != self.flat_param._unpadded_unsharded_size  # type: ignore[attr-defined]
         )
 
 

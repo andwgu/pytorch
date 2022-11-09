@@ -11,6 +11,7 @@ from torch.distributed.fsdp._common_utils import (
     _FSDPState,
     _get_param_to_fqns,
 )
+from torch.distributed.fsdp._utils import p_assert
 from torch.distributed.fsdp.flat_param import FlatParameter, FlatParamHandle
 
 _HandlesKey = Tuple[FlatParamHandle, ...]
@@ -48,6 +49,8 @@ class _ExecOrderData:
         self.handles_post_forward_order: List[_HandlesKey] = []
         # Maps each handles key to its index in `handles_post_forward_order`
         self.handles_to_post_forward_order_index: Dict[_HandlesKey, int] = {}
+        # Tracks the pre-backward order for profiling
+        self.handles_pre_backward_order: List[_HandlesKey] = []
         self._iter = 0
 
         # Gives the max number of backward/forward prefetched all-gathers by a
@@ -61,6 +64,7 @@ class _ExecOrderData:
             dist.DebugLevel.DETAIL,
         ]
         self.process_group: Optional[dist.ProcessGroup] = None
+        self.rank: Optional[int] = None
         self.world_size: Optional[int] = None
         self.all_handles: List[FlatParamHandle] = []
         # Maps each handle to its index in `all_handles`, which must be the
@@ -148,6 +152,14 @@ class _ExecOrderData:
             target_handles_keys.append(self.handles_pre_forward_order[target_index])
             target_index += 1
         return target_handles_keys
+
+    def record_pre_backward(self, handles: List[FlatParamHandle]) -> None:
+        """
+        Records ``handles`` in the pre-backward order for profiling.
+        """
+        if not handles:
+            return
+        self.handles_pre_backward_order.append(tuple(handles))
 
     def record_post_forward(self, handles: List[FlatParamHandle]) -> None:
         """
@@ -382,7 +394,30 @@ class _ExecOrderData:
         self._iter += 1
         self.handles_to_post_forward_order_index.clear()
         self.handles_post_forward_order.clear()
+        self.handles_pre_backward_order.clear()
         if self._checking_order:
             self.current_order_index = 0
             if self.warn_status == _ExecOrderWarnStatus.WARNING:
                 self.warn_status = _ExecOrderWarnStatus.WARNED
+
+    def check_backward_prefetch_order(self):
+        """
+        Checks the backward prefetching order by comparing the reverse
+        post-forward order used versus the actual pre-backward order.
+        """
+        p_assert(self.rank is not None, "Expects `rank` to be set")
+        if self.rank != 0:
+            return
+        reverse_post_forward_order = list(reversed(self.handles_post_forward_order))
+        if reverse_post_forward_order != self.handles_pre_backward_order:
+            print(
+                f"[Rank {self.rank}] reverse post-forward order differs from "
+                "pre-backward order\nreverse post-forward order: "
+                f"{reverse_post_forward_order}\n"
+                f"pre-backward order: {self.handles_pre_backward_order}"
+            )
+        else:
+            print(
+                f"[Rank {self.rank}] reverse post-forward order matches "
+                f"pre-backward order"
+            )

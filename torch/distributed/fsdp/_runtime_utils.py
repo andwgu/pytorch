@@ -490,6 +490,7 @@ def _pre_backward_hook(
     # same module forward computation
     if _handles_key and state._ran_pre_backward_hook.get(_handles_key, False):
         return
+    state._exec_order_data.record_pre_backward(_handles)
 
     with torch.autograd.profiler.record_function(
         "FullyShardedDataParallel._pre_backward_hook"
@@ -852,6 +853,8 @@ def _post_backward_final_callback(
             # post-backward hooks to finish explicitly since CPU gradients do
             # not automatically synchronize with the GPU
             torch.cuda.current_stream().synchronize()
+    if state._debug_level == torch.distributed.DebugLevel.DETAIL:
+        state._exec_order_data.check_backward_prefetch_order()
     state._exec_order_data.next_iter()
 
     states = [state] if _is_composable(state) else state.fsdp_modules(state)

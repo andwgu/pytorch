@@ -1,3 +1,4 @@
+import copy
 import functools
 import warnings
 from typing import (
@@ -24,8 +25,10 @@ from torch.distributed.fsdp._common_utils import (
     TrainingState,
 )
 from torch.distributed.fsdp._init_utils import HYBRID_SHARDING_STRATEGIES
+from torch.distributed.fsdp._init_utils import _init_param_handle_from_params
 from torch.distributed.fsdp._utils import (
     _apply_to_tensors,
+    _free_storage,
     _no_dispatch_record_stream,
     p_assert,
 )
@@ -372,10 +375,24 @@ def _post_forward(
 def _post_forward_reshard(
     state: _FSDPState,
     handles: List[FlatParamHandle],
+    module: nn.Module,
 ) -> None:
     """Reshards parameters in the post-forward."""
     if not handles:
         return
+    # TODO: Unify logic (probably look at the `self._modules` computation).
+    if state._use_exec_order_policy:
+        handles_to_reshard: List[FlatParamHandle] = []
+        for handle in handles:
+            # Only reshard if all corresponding modules have ran their forward
+            state._handle_to_forwarded_modules[handle].add(module)
+            all_handle_modules_forwarded = (
+                state._handle_to_forwarded_modules[handle] == handle.flat_param._modules
+            )
+            if all_handle_modules_forwarded:
+                handles_to_reshard.append(handle)
+    else:
+        handles_to_reshard = handles
     # Do not free the root's parameters in the post-forward for `FULL_SHARD`
     # with the intention that they are immediately used for backward
     # computation (though this may not be true)
@@ -384,9 +401,9 @@ def _post_forward_reshard(
     free_unsharded_flat_params = [
         not state._is_root
         and handle._config.sharding_strategy in RESHARD_AFTER_FORWARD_STRATEGIES
-        for handle in handles
+        for handle in handles_to_reshard
     ]
-    _reshard(state, handles, free_unsharded_flat_params)
+    _reshard(state, handles_to_reshard, free_unsharded_flat_params)
 
 
 @no_type_check
@@ -409,6 +426,8 @@ def _root_pre_forward(
     p_assert(state._is_root is not None, "Expects a root FSDP to have been set")
     if not state._is_root:
         return
+    if hasattr(state, "_handle_to_forwarded_modules"):
+        state._handle_to_forwarded_modules.clear()
     if state.forward_prefetch:
         handles_keys = []
         if _is_composable(state):
@@ -498,7 +517,7 @@ def _pre_backward_hook(
             _clear_grads_if_needed(_all_handles(state))
         elif _handles_key:
             allowed_states = [TrainingState.IDLE]
-            if _is_composable(state):
+            if _is_composable(state) or state._use_exec_order_policy:
                 allowed_states.append(TrainingState.FORWARD_BACKWARD)
             _assert_in_training_states(state, allowed_states)
         state.training_state = TrainingState.FORWARD_BACKWARD
@@ -561,6 +580,10 @@ def _post_backward_hook(
             f"Expects `BACKWARD_PRE` or `BACKWARD_POST` state but got {handle._training_state}",
         )
         handle._training_state = HandleTrainingState.BACKWARD_POST
+
+        if state._use_exec_order_policy and state._exec_order_data.is_first_iter:
+            # Record the `FlatParamHandle` gradient ready order
+            state._handles_post_backward_order.append(handle)
 
         if param.grad is None:
             return
@@ -790,6 +813,7 @@ def _post_backward_final_callback(
             # post-backward hooks to finish explicitly since CPU gradients do
             # not automatically synchronize with the GPU
             torch.cuda.current_stream().synchronize()
+    is_first_iter = state._exec_order_data.is_first_iter
     state._exec_order_data.next_iter()
 
     states = [state] if _is_composable(state) else state.fsdp_modules(state)
@@ -803,6 +827,19 @@ def _post_backward_final_callback(
         state._handles_prefetched.clear()
     # Reset for cases like one forward and multiple backwards
     state._post_backward_callback_queued = False
+
+    # TODO: To support multi-modal models, we need to keep trying to bucket any
+    # not-yet-bucketed `FlatParamHandle`s until all have been bucketed.
+    if state._use_exec_order_policy and is_first_iter:
+        # Bucket `FlatParamHandle`s based on the post-backward order
+        handles_per_flat_param = _bucket_param_handles(
+            state._handles_post_backward_order,
+            state._exec_order_comm_size,
+        )
+        if state.rank == 0:
+            print(f"[Rank {state.rank}] bucketed: {handles_per_flat_param}")
+        delattr(state, "_handles_post_backward_order")
+        _init_param_handles_from_handles(state, handles_per_flat_param)
 
 
 @no_type_check
@@ -1012,6 +1049,7 @@ def _register_post_forward_hooks(
                 _post_forward_reshard,
                 state,
                 module_param_handles,
+                module,
             )
             hook = functools.partial(
                 _post_forward,
@@ -1147,7 +1185,7 @@ def _wait_for_computation_stream(
     computation_stream: torch.cuda.Stream,
     unshard_stream: torch.cuda.Stream,
     pre_unshard_stream: torch.cuda.Stream,
-):
+) -> None:
     """
     Has the unshard and pre-unshard streams wait for the computation stream.
     For example, this should be called in the FSDP root's pre-forward to
@@ -1160,9 +1198,7 @@ def _wait_for_computation_stream(
     pre_unshard_stream.wait_stream(computation_stream)
 
 
-def _clear_grads_if_needed(
-    handles: List[FlatParamHandle],
-):
+def _clear_grads_if_needed(handles: List[FlatParamHandle]) -> None:
     """
     Clears the original parameters' gradients if needed. This method's CPU
     overhead is minimal, so we may call it throughout FSDP methods, which serve
@@ -1250,3 +1286,94 @@ def _cast_buffers_to_dtype_and_device(
             buffer.data = buffer.to(device=device)
         else:
             buffer.data = buffer.to(device=device, dtype=buffer_dtype)
+
+
+def _init_param_handles_from_handles(
+    state: _FSDPState,
+    handles_per_flat_param: List[List[FlatParamHandle]],
+) -> None:
+    """
+    Initializes ``FlatParamHandle`` s from a list of lists of
+    ``FlatParamHandle`` s, where each inner list represents a group of existing
+    ``FlatParamHandle`` s to coalesce into a new one. Both the parameter and
+    gradient data are coalesced.
+    """
+    state._handles.clear()
+    state.params.clear()
+    state._module_to_handles.clear()
+    root_module = _get_root_module(state, handles_per_flat_param)
+    for old_handles in handles_per_flat_param:
+        computation_stream = torch.cuda.current_stream()
+        # TODO: To save peak memory, we may be able to unshard the parameters,
+        # construct the new `FlatParameter`, shard, and then repeat for the
+        # gradients instead unsharding parameters and gradients simultaneously.
+        _unshard(state, old_handles, computation_stream, computation_stream)
+        _unshard_grads(old_handles)
+        orig_params: List[nn.Parameter] = []
+        for old_handle in old_handles:
+            old_handle.free_flat_param_sharded_attributes()
+            computation_stream.synchronize()  # free memory immediately
+            orig_params.extend(old_handle.flat_param._params)
+        # NOTE: This initialization logic happens on the compute device.
+        _init_param_handle_from_params(state, orig_params, root_module)
+    for handle in state._handles:
+        handle.init_flat_param_attributes()
+    # Re-register forward hooks since the handle construction changed
+    modules = list(root_module.modules())
+    _register_pre_forward_hooks(state, modules)
+    _register_post_forward_hooks(state, modules)
+
+
+def _get_root_module(
+    state: _FSDPState, handles_per_flat_param: List[List[FlatParamHandle]]
+) -> nn.Module:
+    # TODO: Temporary solution to get the root module without passing it via a
+    # function argument
+    if _is_composable(state):
+        root_module = None
+        for old_handles in handles_per_flat_param:
+            for old_handle in old_handles:
+                for module in old_handle.flat_param._modules:
+                    if getattr(module, "_is_root", False):
+                        root_module = module
+                        break
+                if root_module is not None:
+                    break
+            if root_module is not None:
+                break
+        p_assert(root_module is not None, "No root module!")
+    else:
+        root_module = state
+    return root_module
+
+
+def _bucket_param_handles(
+    handles_post_backward_order: List[FlatParamHandle],
+    bucket_size: int,
+) -> List[List[FlatParamHandle]]:
+    """
+    Buckets the ``FlatParamHandle`` s in ``handles_post_backward_order``
+    according to the bucket size threshold ``bucket_size``. A bucket (i.e. a
+    group of ``FlatParamHandle`` s) is finalized when its total size is at
+    least ``bucket_size``, and we move onto a new bucket.
+
+    Args:
+        bucket_size (int): Bucket size threshold in bytes.
+    """
+    handles_per_flat_param: List[List[FlatParamHandle]] = []
+    curr_bucket_handles: List[FlatParamHandle] = []
+    curr_bucket_size = 0
+    # TODO: Investigate if reversing this is important.
+    for handle in reversed(handles_post_backward_order):
+        curr_bucket_size += (
+            handle.flat_param._padded_unsharded_size.numel()
+            * handle.flat_param.element_size()
+        )
+        curr_bucket_handles.append(handle)
+        if curr_bucket_size >= bucket_size:
+            handles_per_flat_param.append(copy.copy(curr_bucket_handles))
+            curr_bucket_size = 0
+            curr_bucket_handles.clear()
+    if curr_bucket_handles:
+        handles_per_flat_param.append(curr_bucket_handles)
+    return handles_per_flat_param

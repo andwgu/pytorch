@@ -41,6 +41,7 @@ from torch.distributed.fsdp._init_utils import (
     _init_core_state,
     _init_ignored_module_states,
     _init_param_handle_from_module,
+    _init_param_handles_from_module,
     _init_prefetching_state,
     _init_process_group_state,
     _init_runtime_state,
@@ -54,6 +55,8 @@ from torch.distributed.fsdp._runtime_utils import (
     _post_forward_reshard,
     _pre_forward,
     _pre_forward_unshard,
+    _register_post_forward_hooks,
+    _register_pre_forward_hooks,
     _root_pre_forward,
 )
 from torch.distributed.fsdp._wrap_utils import _auto_wrap
@@ -95,7 +98,7 @@ from ._unshard_param_utils import (
 )
 from ._utils import p_assert
 from .flat_param import FlatParameter, FlatParamHandle
-from .wrap import _FSDPPolicy
+from .wrap import _FSDPPolicy, ExecOrderPolicy
 
 
 __all__ = [
@@ -345,10 +348,12 @@ class FullyShardedDataParallel(nn.Module):
         # Note that this is done before auto_wrapping, so that child FSDP modules simply pick up
         # the same process group state as the root FSDP module.
         _init_process_group_state(self, process_group, sharding_strategy, auto_wrap_policy)
-        if auto_wrap_policy is not None:
+        self._use_exec_order_policy = isinstance(auto_wrap_policy, ExecOrderPolicy)
+        if self._use_exec_order_policy and not use_orig_params:
+            raise ValueError("`ExecOrderPolicy` requires `use_orig_params=True`")
+        if auto_wrap_policy is not None and not self._use_exec_order_policy:
             auto_wrap_kwargs = {
                 "module": module,
-                "auto_wrap_policy": auto_wrap_policy,
                 "wrapper_cls": FullyShardedDataParallel,
                 "ignored_modules": self._ignored_modules,
                 "ignored_params": self._ignored_params,
@@ -390,21 +395,36 @@ class FullyShardedDataParallel(nn.Module):
         _init_runtime_state(self)
         _init_prefetching_state(self, backward_prefetch, forward_prefetch)
         _init_buffer_state(self, module)
-        _init_param_handle_from_module(
-            self,
-            module,
-            device_id,
-            param_init_fn,
-            sync_module_states,
-            FullyShardedDataParallel,
-        )
         self._fsdp_wrapped_module = module
-        if not use_orig_params:
-            _check_orig_params_flattened(self, self._ignored_params)
-            _register_flat_param(self, self)
+        if self._use_exec_order_policy:
+            _init_param_handles_from_module(
+                self,
+                module,
+                auto_wrap_policy,
+                device_id,
+                param_init_fn,
+                sync_module_states,
+            )
+        else:
+            _init_param_handle_from_module(
+                self,
+                module,
+                device_id,
+                param_init_fn,
+                sync_module_states,
+                FullyShardedDataParallel,
+            )
+            if not use_orig_params:
+                _check_orig_params_flattened(self, self._ignored_params)
+                _register_flat_param(self, self)
 
         # Delete to avoid keeping references after the constructor
         delattr(self, "_ignored_params")
+
+        if self._use_exec_order_policy:
+            modules = list(module.modules())
+            _register_pre_forward_hooks(self, modules)
+            _register_post_forward_hooks(self, modules)
 
         # `_state_dict_type` controls the `state_dict()` behavior, which is
         # implemented using post-save and pre-load hooks
@@ -699,6 +719,9 @@ class FullyShardedDataParallel(nn.Module):
         ):
             unused = None
             _root_pre_forward(self, self, unused)
+            if self._use_exec_order_policy:
+                # Run pre/post-forward via hooks
+                return self._fsdp_wrapped_module(*args, **kwargs)
             unshard_fn = functools.partial(_pre_forward_unshard, self, self._handles)
             reshard_fn = functools.partial(_post_forward_reshard, self, self._handles)
             args, kwargs = _pre_forward(

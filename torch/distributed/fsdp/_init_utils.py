@@ -48,7 +48,7 @@ from torch.distributed.fsdp.flat_param import (
     HandleConfig,
     HandleShardingStrategy,
 )
-from torch.distributed.fsdp.wrap import _FSDPPolicy
+from torch.distributed.fsdp.wrap import _FSDPPolicy, ExecOrderPolicy
 from torch.distributed.utils import _sync_params_and_buffers
 from torch.utils.hooks import RemovableHandle
 
@@ -310,6 +310,11 @@ def _init_core_state(
     state._handles = _handles
     params: List[FlatParameter] = []
     state.params = params
+    if state._use_exec_order_policy:
+        # TODO: Move this to `_ExecOrderData` if we track the post-backward
+        # order there for other reasons.
+        _handles_post_backward_order: List[FlatParamHandle] = []
+        state._handles_post_backward_order = _handles_post_backward_order
     return state
 
 
@@ -323,6 +328,12 @@ def _init_runtime_state(
     state._pre_forward_handles = _pre_forward_handles
     _post_forward_handles: List[RemovableHandle] = []
     state._post_forward_handles = _post_forward_handles
+    # Mapping from `FlatParamHandle` to the modules with parameters in the
+    # corresponding `FlatParameter` that have run their forward
+    _handle_to_forwarded_modules: Dict[
+        FlatParamHandle, Set[nn.Module]
+    ] = collections.defaultdict(set)
+    state._handle_to_forwarded_modules = _handle_to_forwarded_modules
     state._sync_gradients = True
     state._communication_hook = _get_default_comm_hook(state.sharding_strategy)
     state._communication_hook_state = _get_default_comm_hook_state(state.process_group)
@@ -416,6 +427,8 @@ def _init_param_handles_from_module(
     Initializes all ``FlatParamHandle`` s from a module ``root_module``. This
     is the non-module-wrapper code path.
     """
+    state._use_exec_order_policy = isinstance(policy, ExecOrderPolicy)
+    state._exec_order_comm_size = policy._comm_size
     submodule_to_states = _get_submodule_to_states(
         root_module,
         policy,
@@ -469,6 +482,9 @@ def _init_param_handle_from_params(
     root_module: nn.Module,
     comm_module: nn.Module,
 ):
+    """
+    Initializes a ``FlatParamHandle`` from a list of parameters ``params``.
+    """
     if len(params) == 0:
         return
     handle_config = HandleConfig(
@@ -487,7 +503,7 @@ def _init_param_handle_from_params(
         state.process_group,
         state._use_orig_params,
     )
-    # TODO: Can simplify call `shard()` in the `FlatParamHandle` ctor
+    # TODO: Can simplify to call `shard()` in the `FlatParamHandle` ctor
     handle.shard()
     assert handle not in state._handles
     state.params.append(handle.flat_param)

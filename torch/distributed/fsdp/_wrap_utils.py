@@ -1,7 +1,7 @@
 import collections
 import functools
 import warnings
-from typing import Any, Deque, Dict, List, NamedTuple, Set, Tuple
+from typing import Any, Callable, Deque, Dict, List, NamedTuple, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,42 @@ class SubmoduleState(NamedTuple):
     buffer_names: List[str]
 
 
+def _check_for_existing_wrapping(
+    root_module: nn.Module,
+    module_wrapper_cls: Any,
+) -> None:
+    # For auto wrapping, submodules should not already be wrapped with FSDP
+    # since double wrapping is not supported
+    for module_name, module in root_module.named_modules():
+        if isinstance(module, module_wrapper_cls):
+            raise ValueError(
+                f"Expected {module_name} to NOT be FullyShardedDataParallel "
+                "if using an `auto_wrap_policy`"
+            )
+
+
+def _adjust_policy(
+    policy: Callable,
+    root_module: nn.Module,
+    fsdp_kwargs: Dict[str, Any],
+) -> Callable:
+    """Makes manual adjustments to ``policy`` and returns the new policy."""
+    mixed_precision = fsdp_kwargs["mixed_precision"]
+    if mixed_precision is not None and _contains_batchnorm(root_module):
+        _override_batchnorm_mixed_precision(root_module)
+        policy = functools.partial(
+            _or_policy, policies=[_wrap_batchnorm_individually, policy]
+        )
+        warnings.warn(
+            "Both mixed precision and an `auto_wrap_policy` were specified "
+            "for FSDP, where the wrapped module has batch norm submodules. "
+            "The batch norm submodules will be wrapped as separate FSDP "
+            "instances with mixed precision disabled since some batch norm "
+            "kernels do not support low precision."
+        )
+    return policy
+
+
 def _auto_wrap(
     auto_wrap_kwargs: Dict[str, Any],
     fsdp_kwargs: Dict[str, Any],
@@ -51,28 +87,10 @@ def _auto_wrap(
         auto_wrap_policy = auto_wrap_policy.policy
     root_module = auto_wrap_kwargs["module"]
     assert auto_wrap_policy is not None
-    # For auto wrapping, submodules should not already be wrapped with FSDP
-    # since double wrapping is not supported
-    for module_name, module in root_module.named_modules():
-        if isinstance(module, module_wrapper_cls):
-            raise ValueError(
-                f"Expected {module_name} to NOT be FullyShardedDataParallel "
-                "if using an `auto_wrap_policy`"
-            )
-    mixed_precision = fsdp_kwargs["mixed_precision"]
-    if mixed_precision is not None and _contains_batchnorm(root_module):
-        _override_batchnorm_mixed_precision(root_module)
-        auto_wrap_policy = functools.partial(
-            _or_policy, policies=[_wrap_batchnorm_individually, auto_wrap_policy]
-        )
-        warnings.warn(
-            "Both mixed precision and an `auto_wrap_policy` were specified "
-            "for FSDP, where the wrapped module has batch norm submodules. "
-            "The batch norm submodules will be wrapped as separate FSDP "
-            "instances with mixed precision disabled since some batch norm "
-            "kernels do not support low precision."
-        )
-    auto_wrap_kwargs["auto_wrap_policy"] = auto_wrap_policy
+    _check_for_existing_wrapping(root_module, module_wrapper_cls)
+    auto_wrap_kwargs["auto_wrap_policy"] = _adjust_policy(
+        auto_wrap_policy, root_module, fsdp_kwargs
+    )
     _recursive_wrap(**auto_wrap_kwargs, **fsdp_kwargs)
 
 

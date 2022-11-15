@@ -98,6 +98,17 @@ class ModuleWrapPolicy(_FSDPPolicy):
         return super().__repr__() + f"({self._module_classes_str})"
 
 
+class AlwaysWrapPolicy(_FSDPPolicy):
+    """This is a wrapper around :func:`always_wrap_policy`."""
+
+    def __init__(self):
+        self._policy = always_wrap_policy
+
+    @property
+    def policy(self):
+        return self._policy
+
+
 class ExecOrderPolicy(_FSDPPolicy):
     """
     This FSDP policy uses the gradient-ready order to construct FSDP's

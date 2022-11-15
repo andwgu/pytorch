@@ -427,8 +427,6 @@ def _init_param_handles_from_module(
     Initializes all ``FlatParamHandle`` s from a module ``root_module``. This
     is the non-module-wrapper code path.
     """
-    state._use_exec_order_policy = isinstance(policy, ExecOrderPolicy)
-    state._exec_order_comm_size = policy._comm_size
     submodule_to_states = _get_submodule_to_states(
         root_module,
         policy,

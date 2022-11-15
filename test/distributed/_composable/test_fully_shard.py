@@ -18,7 +18,7 @@ from torch.distributed.fsdp._common_utils import (
 )
 from torch.distributed.fsdp.api import MixedPrecision
 from torch.distributed.fsdp.flat_param import _HandlesKey, FlatParamHandle
-from torch.distributed.fsdp.wrap import _FSDPPolicy, ModuleWrapPolicy
+from torch.distributed.fsdp.wrap import _FSDPPolicy, AlwaysWrapPolicy, ModuleWrapPolicy
 from torch.testing._internal.common_dist_composable import (
     CompositeParamModel,
     UnitModule,
@@ -27,7 +27,12 @@ from torch.testing._internal.common_distributed import (
     SaveForwardInputsModel,
     skip_if_lt_x_gpu,
 )
-from torch.testing._internal.common_fsdp import FSDPTest
+from torch.testing._internal.common_fsdp import (
+    CUDAInitMode,
+    FSDPInitMode,
+    FSDPTest,
+    TransformerWithSharedParams,
+)
 from torch.testing._internal.common_utils import run_tests, TEST_WITH_DEV_DBG_ASAN
 
 if not dist.is_available():
@@ -207,6 +212,20 @@ class TestFSDPInitialization(FSDPTest):
                 torch.device("cuda", torch.cuda.current_device()),
             )
             self.assertEqual(composable_param, fsdp_wrapped_param)
+
+    @skip_if_lt_x_gpu(2)
+    def test_shared_params(self):
+        composable_module = TransformerWithSharedParams.init(
+            self.process_group,
+            FSDPInitMode.NO_FSDP,
+            CUDAInitMode.CUDA_BEFORE,
+            {},
+            deterministic=True,
+        )
+        fully_shard(composable_module, self.process_group, policy=AlwaysWrapPolicy())
+        if self.rank == 0:
+            for handle in fully_shard.state(composable_module)._handles:
+                print(f"{handle.flat_param._fqns}")
 
 
 class TestFSDPRuntime(FSDPTest):
@@ -412,7 +431,6 @@ class TestFSDPRuntime(FSDPTest):
 
 
 class TestMixedPrecision(FSDPTest):
-
     @property
     def world_size(self):
         return 2
@@ -423,7 +441,8 @@ class TestMixedPrecision(FSDPTest):
         float16 = MixedPrecision(param_dtype=torch.float16)
 
         model = SaveForwardInputsModel(
-            forward_inputs=forward_inputs, cast_forward_inputs=False,
+            forward_inputs=forward_inputs,
+            cast_forward_inputs=False,
         ).cuda()
         c1, c2 = model.c1, model.c2
         x = torch.zeros(2, 100, device="cuda")

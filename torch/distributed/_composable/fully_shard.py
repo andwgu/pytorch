@@ -25,7 +25,7 @@ from torch.distributed.fsdp.api import (
     MixedPrecision,
     ShardingStrategy,
 )
-from torch.distributed.fsdp.wrap import _FSDPPolicy
+from torch.distributed.fsdp.wrap import _FSDPPolicy, ExecOrderPolicy
 
 
 @contract
@@ -55,6 +55,9 @@ def fully_shard(
     use_orig_params = True
     backward_prefetch_limit = 1
     forward_prefetch_limit = 1
+    state._use_exec_order_policy = isinstance(policy, ExecOrderPolicy)
+    if state._use_exec_order_policy:
+        state._exec_order_comm_size = policy._comm_size
     state = _init_core_state(
         state,
         strategy or ShardingStrategy.FULL_SHARD,

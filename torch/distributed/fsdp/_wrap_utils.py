@@ -1,10 +1,12 @@
 import collections
 import functools
 import warnings
-from typing import Any, Callable, Deque, Dict, List, NamedTuple, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Deque, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
+from torch.distributed.fsdp._shared_param_utils import get_shared_param_info_to_lca
 from torch.distributed.fsdp._utils import (
     _contains_batchnorm,
     _override_batchnorm_mixed_precision,
@@ -137,6 +139,31 @@ def _get_submodule_to_states(
     for ignored_param in ignored_params:
         visited_params.add(ignored_param)
     visited_buffers = set()
+
+    shared_param_info_to_lca = get_shared_param_info_to_lca(root_module, ignored_params)
+    shared_params = set()
+    lca_module_to_states = {}
+    for shared_param_info, lca_module in shared_param_info_to_lca.items():
+        shared_param = shared_param_info.param
+        shared_params.add(shared_param)
+        # TODO: param names are hard -- we should just avoid them in the fast
+        # path and only reacaquire them when materializing module
+        # SKIP PARAM NAMES FOR NOW
+        if lca_module in lca_module_to_states:
+            lca_module_to_states[lca_module] = SubmoduleState(
+                lca_module_to_states[lca_module].params + [shared_param],
+                lca_module_to_states[lca_module].buffers,
+                lca_module_to_states[lca_module].param_names,
+                lca_module_to_states[lca_module].buffer_names,
+            )  # TODO: maybe do not create new one every time
+        else:
+            lca_module_to_states[lca_module] = SubmoduleState(
+                [shared_param], [], [], []
+            )
+    # if torch.distributed.get_rank() == 0:
+    #     print(f"lca_module_to_states: {lca_module_to_states}")
+    visited_params.update(shared_params)  # already handled shared parameters
+
     # Constructing `wrapped_modules` with `_recursive_wrap()` follows a
     # post-order traversal. We record state in `submodule_to_states` using a
     # reverse post-ordering since that is a topological sort. This assigns
@@ -167,8 +194,16 @@ def _get_submodule_to_states(
                     visited_buffers.add(buffer)
                     buffer_names.append(prefix + buffer_name)
             for child_module_name, child_module in module.named_children():
-                if child_module not in wrapped_modules_set:
+                if (
+                    child_module not in wrapped_modules_set
+                    and child_module not in ignored_modules
+                ):
                     queue.append((child_module, prefix + child_module_name + "."))
+        if submodule in lca_module_to_states:
+            params.extend(lca_module_to_states[submodule].params)
+            buffers.extend(lca_module_to_states[submodule].buffers)
+            param_names.extend(lca_module_to_states[submodule].param_names)
+            buffer_names.extend(lca_module_to_states[submodule].buffer_names)
         submodule_to_states[submodule] = SubmoduleState(
             params, buffers, param_names, buffer_names
         )

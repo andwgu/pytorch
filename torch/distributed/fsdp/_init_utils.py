@@ -333,6 +333,12 @@ def _init_runtime_state(
     state._pre_forward_handles = _pre_forward_handles
     _post_forward_handles: List[RemovableHandle] = []
     state._post_forward_handles = _post_forward_handles
+    # Mapping from `FlatParamHandle` to the active modules running forward that
+    # consume the handle's `FlatParameter`
+    _handle_to_active_forward_modules: Dict[
+        FlatParamHandle, Set[nn.Module]
+    ] = collections.defaultdict(set)
+    state._handle_to_active_forward_modules = _handle_to_active_forward_modules
     state._sync_gradients = True
     state._communication_hook = _get_default_comm_hook(state.sharding_strategy)
     state._communication_hook_state = _get_default_comm_hook_state(state.process_group)
@@ -389,16 +395,17 @@ def _init_param_handle_from_module(
     _check_single_device_module(fully_sharded_module, state._ignored_params)
     device_from_device_id = _get_device_from_device_id(device_id, state.rank)
     is_meta_module, is_torchdistX_deferred_init = _need_to_materialize_module(
-        root_module, state._ignored_params
+        fully_sharded_module, state._ignored_params
     )
     # Materialize the module if needed
     if (is_meta_module or is_torchdistX_deferred_init) and param_init_fn is not None:
-        _materialize_with_param_init_fn(root_module, param_init_fn)
+        _materialize_with_param_init_fn(fully_sharded_module, param_init_fn)
     elif is_meta_module:
-        _materialize_meta_module(root_module, device_id)
+        _materialize_meta_module(fully_sharded_module, device_id)
     elif is_torchdistX_deferred_init:
         deferred_init.materialize_module(
-            root_module, check_fn=lambda k: not isinstance(k, module_wrapper_cls)
+            fully_sharded_module,
+            check_fn=lambda k: not isinstance(k, module_wrapper_cls),
         )
     # TODO: Investigate refactoring `_move_module_to_device()` to
     # `_move_states_to_device()` to avoid the `device_id` + CPU offload hack
@@ -416,7 +423,11 @@ def _init_param_handle_from_module(
         _sync_module_params_and_buffers(
             fully_sharded_module, managed_params, state.process_group
         )
-    _init_param_handle_from_params(state, managed_params, fully_sharded_module)
+    # TODO: No support for explicit LCA computation yet for wrapper FSDP
+    lca_modules = []
+    _init_param_handle_from_params(
+        state, managed_params, fully_sharded_module, lca_modules
+    )
     return state
 
 
@@ -435,7 +446,10 @@ def _init_param_handles_from_module(
     a fully sharded module, and some of its submodules may be as well,
     depending on ``policy``. See [Note: Fully Sharded Module].
     """
-    fully_sharded_module_to_states = _get_fully_sharded_module_to_states(
+    (
+        fully_sharded_module_to_states,
+        shared_param_to_lca_module,
+    ) = _get_fully_sharded_module_to_states(
         root_module,
         policy,
         state._ignored_modules,
@@ -444,9 +458,12 @@ def _init_param_handles_from_module(
     _check_single_device_module(root_module, state._ignored_params)
     device_from_device_id = _get_device_from_device_id(device_id, state.rank)
     # Initialize and shard `FlatParamHandle`s one by one following bottom-up
-    # order (hence the `reversed`) to avoid increasing peak GPU memory usage
+    # order to avoid increasing peak GPU memory usage
     materialized_module = False
-    for fully_sharded_module, (params, buffers) in reversed(fully_sharded_module_to_states.items()):
+    for fully_sharded_module, (
+        params,
+        buffers,
+    ) in fully_sharded_module_to_states.items():
         # Materialize the module if needed
         is_meta_module, is_torchdistX_deferred_init = _need_to_materialize_module(
             fully_sharded_module, state._ignored_params
@@ -456,14 +473,14 @@ def _init_param_handles_from_module(
             # Save the parameter and buffer names to reacquire references after
             # after materialization since their variables may change
             param_names, buffer_names = _get_state_names_for_states(
-                submodule, params, buffers
+                fully_sharded_module, params, buffers
             )
         if (
             is_meta_module or is_torchdistX_deferred_init
         ) and param_init_fn is not None:
-            _materialize_with_param_init_fn(submodule, param_init_fn)
+            _materialize_with_param_init_fn(fully_sharded_module, param_init_fn)
         elif is_meta_module:
-            _materialize_meta_module(submodule, device_id)
+            _materialize_meta_module(fully_sharded_module, device_id)
         elif is_torchdistX_deferred_init:
             deferred_init.materialize_module(
                 root_module,
@@ -471,7 +488,10 @@ def _init_param_handles_from_module(
             )
         if materialized_module:
             # Reacquire references using the pre-computed state names
-            params = [fully_sharded_module.get_parameter(param_name) for param_name in param_names]
+            params = [
+                fully_sharded_module.get_parameter(param_name)
+                for param_name in param_names
+            ]
             buffers = [
                 fully_sharded_module.get_buffer(buffer_name)
                 for buffer_name in buffer_names
@@ -488,7 +508,12 @@ def _init_param_handles_from_module(
             _sync_module_states(params, buffers, state.process_group)
         # Pass `root_module` to have internal FQN metadata prefix starting from
         # it instead of `submodule`
-        _init_param_handle_from_params(state, params, fully_sharded_module)
+        lca_modules = {
+            shared_param_to_lca_module[param]
+            for param in params
+            if param in shared_param_to_lca_module
+        }
+        _init_param_handle_from_params(state, params, fully_sharded_module, lca_modules)
     # Reverse to preserve top-down order like `_fsdp_handles()`
     state._handles.reverse()
     return state
@@ -499,6 +524,7 @@ def _init_param_handle_from_params(
     state: _FSDPState,
     params: List[nn.Parameter],
     fully_sharded_module: nn.Module,
+    lca_modules: List[nn.Module],
 ):
     if len(params) == 0:
         return
@@ -513,12 +539,19 @@ def _init_param_handle_from_params(
         state.mixed_precision.keep_low_precision_grads,
         state.process_group,
         state._use_orig_params,
+        lca_modules,
     )
     # TODO: Can simplify call `shard()` in the `FlatParamHandle` ctor
     handle.shard()
     assert handle not in state._handles
     state.params.append(handle.flat_param)
     state._handles.append(handle)
+    # NOTE: By including all of `_modules` in the dict values, for shared
+    # parameters assigned to an LCA module not among the owning modules, the
+    # LCA module performs the actual unshard, and the owning modules' unshards
+    # are no-ops. The reshard waits for all consuming modules to run.
+    for module in handle.flat_param._modules:
+        state._module_to_handles[module].append(handle)
     state._fully_sharded_module_to_handles[handle._fully_sharded_module].append(handle)
     num_fully_sharded_module_handles = len(
         state._fully_sharded_module_to_handles[handle._fully_sharded_module]

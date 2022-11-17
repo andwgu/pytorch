@@ -150,6 +150,7 @@ class TestFlattenParams(FSDPTest):
                 *self._get_default_config(),
                 self.process_group,
                 False,
+                [],
             )
 
     @skip_if_lt_x_gpu(1)
@@ -222,6 +223,7 @@ class TestFlattenParams(FSDPTest):
             *self._get_default_config(),
             self.process_group,
             False,
+            [],
         )
         self.assertEqual(ref_numel, flat_param_handle.flat_param.numel())
 
@@ -323,6 +325,7 @@ class TestFlattenParams(FSDPTest):
             *self._get_default_config(),
             self.process_group,
             False,
+            [],
         )
 
         def _test(kwargs, expected):

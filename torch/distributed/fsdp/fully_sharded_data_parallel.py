@@ -673,10 +673,14 @@ class FullyShardedDataParallel(nn.Module, _FSDPState):
         ):
             args, kwargs = _root_pre_forward(self, self, args, kwargs)
             unused = None
-            unshard_fn = functools.partial(_pre_forward_unshard, self, self._handles)
-            reshard_fn = functools.partial(_post_forward_reshard, self, self._handles)
+            unshard_fn = functools.partial(
+                _pre_forward_unshard, self, self._handles, self.module
+            )
+            reshard_fn = functools.partial(
+                _post_forward_reshard, self, self._handles, self.module
+            )
             args, kwargs = _pre_forward(
-                self, self._handles, unshard_fn, self._fsdp_wrapped_module, args, kwargs
+                self, self._handles, unshard_fn, self._fsdp_wrapped_module, unused
             )
             for handle in self._handles:
                 p_assert(

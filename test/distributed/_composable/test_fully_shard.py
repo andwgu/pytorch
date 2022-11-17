@@ -3,14 +3,13 @@
 import contextlib
 import copy
 import functools
+import itertools
 import sys
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
-import itertools
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.nn import TransformerEncoderLayer, TransformerDecoderLayer
 from torch.distributed._composable import fully_shard
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp._common_utils import (
@@ -18,10 +17,14 @@ from torch.distributed.fsdp._common_utils import (
     _FSDPState,
     _is_fsdp_flattened,
 )
-from torch.testing._internal.common_fsdp import _zero_model
 from torch.distributed.fsdp.api import MixedPrecision
 from torch.distributed.fsdp.flat_param import _HandlesKey, FlatParamHandle
-from torch.distributed.fsdp.wrap import _FSDPPolicy, ModuleWrapPolicy
+from torch.distributed.fsdp.wrap import (
+    _ExecOrderBasePolicy,
+    _FSDPPolicy,
+    ModuleWrapPolicy,
+)
+from torch.nn import TransformerDecoderLayer, TransformerEncoderLayer
 from torch.testing._internal.common_dist_composable import (
     CompositeParamModel,
     UnitModule,
@@ -30,7 +33,13 @@ from torch.testing._internal.common_distributed import (
     SaveForwardInputsModel,
     skip_if_lt_x_gpu,
 )
-from torch.testing._internal.common_fsdp import FSDPTest, TransformerWithSharedParams, CUDAInitMode, FSDPInitMode
+from torch.testing._internal.common_fsdp import (
+    _zero_model,
+    CUDAInitMode,
+    FSDPInitMode,
+    FSDPTest,
+    TransformerWithSharedParams,
+)
 from torch.testing._internal.common_utils import run_tests, TEST_WITH_DEV_DBG_ASAN
 
 if not dist.is_available():
@@ -114,40 +123,17 @@ class TestFSDPInitialization(FSDPTest):
         Tests that shared parameters across siblings are correctly assigned to
         their lowest common ancestor module.
         """
-        # TODO: We cannot use `TransformerWithSharedParams` here due to its
-        # external parameter usage.
-        d_vocab = 23
-        d_model = 16
-
-        class ModelWithSharedParams(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.embed_tokens = nn.Embedding(d_vocab, d_model)
-                self.lin = nn.Linear(d_model, d_model)
-                self.seq = nn.Sequential(
-                    nn.Linear(d_model, d_model), nn.Linear(d_model, d_model)
-                )
-                self.output_proj = nn.Linear(d_model, d_vocab)
-                self.relu = nn.ReLU()
-                # Share a parameter across siblings, where the LCA module is
-                # this `ModelWithSharedParams` instance
-                self.output_proj.weight = self.embed_tokens.weight
-
-            def forward(self, x: torch.Tensor):
-                z = self.embed_tokens(x)
-                z = self.relu(self.lin(z))
-                z = self.relu(self.seq(z))
-                return self.output_proj(z)
-
-        composable_module = nn.Sequential(
-            ModelWithSharedParams(),
-            nn.Linear(d_vocab, d_vocab),
+        composable_module = TransformerWithSharedParams.init(
+            self.process_group,
+            FSDPInitMode.NO_FSDP,
+            CUDAInitMode.CUDA_BEFORE,
+            {},
+            deterministic=True,
         )
-        module_classes = {nn.Linear, nn.Embedding}
         fully_shard(
             composable_module,
             self.process_group,
-            policy=ModuleWrapPolicy(module_classes),
+            policy=_ExecOrderBasePolicy(),
             device_id=torch.cuda.current_device(),
         )
 
@@ -536,8 +522,7 @@ class TestFSDPModelCheckpointing(FSDPTest):
 
         # Validate load
         load_composable = fully_shard(
-            copy.deepcopy(local_model),
-            policy=ModuleWrapPolicy({UnitModule})
+            copy.deepcopy(local_model), policy=ModuleWrapPolicy({UnitModule})
         )
         _zero_model(load_composable, summon_full=False)
         for p in load_composable.parameters():
@@ -606,10 +591,12 @@ class TestFSDPModelCheckpointing(FSDPTest):
                 save_model = copy.deepcopy(local_model)
                 save_model = fully_shard(
                     save_model,
-                    policy=ModuleWrapPolicy({TransformerEncoderLayer, TransformerDecoderLayer}),
+                    policy=ModuleWrapPolicy(
+                        {TransformerEncoderLayer, TransformerDecoderLayer}
+                    ),
                     ignored_modules=(
                         save_model.get_ignored_modules() if ignore_modules else []
-                    )
+                    ),
                 )
 
                 # TODO: test state_dict_type after https://github.com/pytorch/pytorch/issues/90954 is resolved
@@ -626,10 +613,12 @@ class TestFSDPModelCheckpointing(FSDPTest):
                 _zero_model(load_model, zero_buffers=True, summon_full=False)
                 fully_shard(
                     load_model,
-                    policy=ModuleWrapPolicy({TransformerDecoderLayer, TransformerEncoderLayer}),
+                    policy=ModuleWrapPolicy(
+                        {TransformerDecoderLayer, TransformerEncoderLayer}
+                    ),
                     ignored_modules=(
                         load_model.get_ignored_modules() if ignore_modules else []
-                    )
+                    ),
                 )
                 load_model.load_state_dict(state_dict)
                 self._check_model_parity(load_model, save_model)
@@ -642,7 +631,9 @@ class TestFSDPModelCheckpointing(FSDPTest):
         for k in composable_sd.keys():
             v1 = composable_sd[k]
             v2 = local_sd[k]
-            self.assertEqual(v1.shape, v2.shape, f"Shape mismatch for {k} {v1.shape} vs {v2.shape}")
+            self.assertEqual(
+                v1.shape, v2.shape, f"Shape mismatch for {k} {v1.shape} vs {v2.shape}"
+            )
 
         # Check actual values
         for k in composable_sd.keys():
@@ -654,9 +645,7 @@ class TestFSDPModelCheckpointing(FSDPTest):
         """
         Checks that m1 and m2 have equivalent named_parameters.
         """
-        for (n1, p1), (n2, p2) in zip(
-            m1.named_parameters(), m2.named_parameters()
-        ):
+        for (n1, p1), (n2, p2) in zip(m1.named_parameters(), m2.named_parameters()):
             self.assertEqual(n1, n2)
             self.assertEqual(p1, p2)
 

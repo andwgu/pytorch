@@ -13,6 +13,7 @@ from torch.distributed.fsdp import (
     CPUOffload,
     FlatParameter,
     FullyShardedDataParallel as FSDP,
+    MixedPrecision,
     ShardingStrategy,
 )
 from torch.distributed.fsdp.wrap import (
@@ -501,6 +502,26 @@ class TestFSDPMisc(FSDPTest):
             _assert_module_states(
                 fsdp, process_group=self.process_group, assert_fn=self.assertEqual
             )
+
+    @skip_if_lt_x_gpu(2)
+    def test_noncast_forward_input_tensor(self):
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                buf = torch.randn((3,))
+                self.register_buffer("buf", buf)
+                self.lin = nn.Linear(3, 3)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.lin(x) + self.buf
+
+        dist.set_debug_level(dist.DebugLevel.DETAIL)
+        model = Model().cuda()
+        fsdp_model = FSDP(
+            model, mixed_precision=MixedPrecision(param_dtype=torch.float16)
+        )
+        inp = torch.randn((2, 3), device="cuda")
+        out = fsdp_model(inp)
 
 
 instantiate_parametrized_tests(TestFSDPMisc)

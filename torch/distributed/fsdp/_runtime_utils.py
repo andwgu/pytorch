@@ -5,6 +5,8 @@ from typing import Any, Callable, Iterable, List, no_type_check, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from torch import is_floating_point
 from torch.autograd import Variable
 from torch.distributed.algorithms._comm_hooks import LOW_PRECISION_HOOKS
 from torch.distributed.fsdp._common_utils import (
@@ -227,6 +229,7 @@ def _pre_forward(
             expected by the hook signature.
         input (Any): Unused; expected by the hook signature.
     """
+    _pre_forward_check_dtype(state, input)
     state.training_state = TrainingState.FORWARD_BACKWARD
     state._exec_order_data.record_pre_forward(handles, module.training)
     for handle in handles:
@@ -252,6 +255,38 @@ def _pre_forward_unshard(
     state._needs_pre_forward_unshard[handles_key] = False
     torch.cuda.current_stream().wait_stream(state._streams["unshard"])
     _prefetch_handles(state, handles_key)
+
+
+def _pre_forward_check_dtype(
+    state: _FSDPState,
+    handles: List[FlatParamHandle],
+    input: Any,
+):
+    """
+    Checks that tensors in the forward inputs have the parameter low precision
+    dtype if parameter mixed precision is enabled and the distributed debug
+    level is DETAIL. This only applies to positional arguments since the
+    pre-forward hook is not registered with kwargs.
+    """
+    if state._debug_level == torch.distributed.DebugLevel.DETAIL and any(
+        handle._uses_param_mixed_precision for handle in handles
+    ):
+        # Assume uniform parameter mixed precision dtype
+        param_dtypes = set(handle._config.low_prec_param_dtype for handle in handles)
+        p_assert(
+            len(param_dtypes) == 1,
+            f"Expects uniform parameter low precision dtype but got {param_dtypes}",
+        )
+        param_dtype = next(iter(param_dtypes))
+
+        def check_dtype(x: torch.Tensor):
+            if torch.is_floating_point(x) and x.dtype != param_dtype:
+                raise RuntimeError(
+                    f"Found tensor with dtype {x.dtype} but expects low "
+                    f"precision dtype {param_dtype} on rank {state.rank}"
+                )
+
+        _apply_to_tensors(check_dtype, input)
 
 
 @no_type_check

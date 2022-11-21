@@ -417,6 +417,7 @@ class _ExecOrderData:
                     f"Reverse post-forward: {reverse_post_forward_str}\n"
                     f"Pre-backward: {pre_backward_str}"
                 )
+                assert 0
         self.handles_to_post_forward_order_index.clear()
         self.handles_post_forward_order.clear()
         self.handles_pre_backward_order.clear()

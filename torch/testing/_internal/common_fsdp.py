@@ -803,6 +803,7 @@ class FSDPTest(MultiProcessTestCase):
         # has finished initialization and that the following test
         # immediately exiting due to a skip doesn't cause flakiness.
         dist.barrier()
+        dist.set_debug_level(dist.DebugLevel.DETAIL)
 
         self.run_test(test_name, pipe)
 

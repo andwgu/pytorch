@@ -118,6 +118,8 @@ class TestFSDPMemory(FSDPTest):
         )
         model = model.cuda()
         model = FSDP(model)
+        if self.rank == 0:
+            print(model)
 
         # We enable momentum so that after the first iteration, the optimizer state is added
         # to the total memory used.
@@ -158,7 +160,8 @@ class TestFSDPMemory(FSDPTest):
         self.assertEqual(output, "")
 
     @skip_if_lt_x_gpu(2)
-    @parametrize("ckpt", ["no_ckpt", "ckpt"])
+    # @parametrize("ckpt", ["no_ckpt", "ckpt"])
+    @parametrize("ckpt", ["no_ckpt"])
     def test_fsdp_memory(self, ckpt):
         # hidden_dim 128: model size ~4MB
         model_hidden_dim = 128

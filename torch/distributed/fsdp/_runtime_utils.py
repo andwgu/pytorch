@@ -501,6 +501,19 @@ def _pre_backward_hook(
         if state._is_root and not state._post_backward_callback_queued:
             _register_post_backward_final_callback(state)
             _clear_grads_if_needed(_all_handles(state))
+            if state.rank == 0:
+                graph_task_exec_order = torch._C._current_graph_task_execution_order()
+                print(f"graph_task_exec_order: {graph_task_exec_order}")
+
+                acc_grad_to_handle = {}
+                for handle in _all_handles(state):
+                    if hasattr(handle.flat_param, "_post_backward_hook_state"):
+                        acc_grad_to_handle[handle.flat_param._post_backward_hook_state[0]] = handle
+                handle_exec_order = []
+                for node in graph_task_exec_order:
+                    if node in acc_grad_to_handle:
+                        handle_exec_order.append(acc_grad_to_handle[node])
+                print(f"handle exec order: {[handle.flat_param._fqns for handle in handle_exec_order]}")
         elif _handles_key:
             allowed_states = [TrainingState.IDLE]
             if _is_composable(state):

@@ -14,7 +14,6 @@ from typing import (
 import torch
 import torch.distributed.fsdp._traversal_utils as traversal_utils
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.distributed.algorithms._comm_hooks import default_hooks, LOW_PRECISION_HOOKS
 from torch.distributed.fsdp._common_utils import (
@@ -719,8 +718,13 @@ def _post_backward_hook(
                 # ahead of the first backward pass reduction, which is possible
                 # since the reduction is issued in a separate stream and is
                 # async and would result in reducing the wrong gradient.
-                unsharded_grad = flat_param.grad.data
+                unsharded_grad = flat_param.grad.data  # already padded
                 flat_param.grad = None
+                p_assert(
+                    unsharded_grad.shape == handle.flat_param._unsharded_size_for_comp,
+                    f"Expects gradient to have shape {handle.flat_param._unsharded_size_for_comp} "
+                    f"but got {unsharded_grad.shape}",
+                )
                 chunks = list(unsharded_grad.chunk(state.world_size))
                 numel_to_pad = (
                     state.world_size * chunks[0].numel() - unsharded_grad.numel()
@@ -729,15 +733,10 @@ def _post_backward_hook(
                     numel_to_pad == 0,
                     f"Expects no padding needed but requires {numel_to_pad} numel",
                 )
-                padded_unsharded_grad = (
-                    F.pad(unsharded_grad, [0, numel_to_pad])
-                    if numel_to_pad > 0
-                    else unsharded_grad
-                )
                 new_sharded_grad = torch.empty_like(chunks[0])  # padded
                 state._communication_hook(
                     state._communication_hook_state,
-                    padded_unsharded_grad,
+                    unsharded_grad,
                     new_sharded_grad,
                 )
                 if handle._sharding_strategy in (

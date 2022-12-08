@@ -333,6 +333,8 @@ def _init_runtime_state(
     state._pre_forward_handles = _pre_forward_handles
     _post_forward_handles: List[RemovableHandle] = []
     state._post_forward_handles = _post_forward_handles
+    _module_to_pre_backward_hook_handle: Dict[nn.Module, RemovableHandle] = {}
+    state._module_to_pre_backward_hook_handle = _module_to_pre_backward_hook_handle
     state._sync_gradients = True
     state._communication_hook = _get_default_comm_hook(state.sharding_strategy)
     state._communication_hook_state = _get_default_comm_hook_state(state.process_group)

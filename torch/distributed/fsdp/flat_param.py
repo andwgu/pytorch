@@ -1177,6 +1177,8 @@ class FlatParamHandle:
         flat_param = self.flat_param
         # TODO (awgu): We should replace these conditional checks to encode
         # the logical intention more directly.
+        if self.rank == 0:
+            print(f"[Rank 0] flat_param: {id(self.flat_param)} {hasattr(self.flat_param, '_saved_grad_shard')}")
         if hasattr(flat_param, "_cpu_grad"):
             # NOTE: This branch includes `NO_SHARD`.
             self._check_sharded(flat_param)
@@ -1202,6 +1204,8 @@ class FlatParamHandle:
         # Delete `_saved_grad_shard` since its existence indicates a previous
         # gradient to accumulate with in the post-backward hook
         if hasattr(flat_param, "_saved_grad_shard"):
+            if self.rank == 0:
+                print(f"[Rank 0] del saved grad shard")
             delattr(flat_param, "_saved_grad_shard")
 
     @contextlib.contextmanager

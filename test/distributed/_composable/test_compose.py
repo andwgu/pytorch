@@ -53,11 +53,14 @@ class TestFSDPCheckpoint(FSDPTest):
         base_optim = torch.optim.Adam(base_model.parameters(), lr=LR)
         test_optim = torch.optim.Adam(test_model.parameters(), lr=LR)
 
-        for _ in range(5):
+        from torchviz import make_dot
+        for _ in range(2):
             test_loss = test_model(x).sum()
             base_loss = base_model(x).sum()
 
             self.assertEqual(test_loss, base_loss)
+
+            make_dot(test_loss, params=dict(test_model.named_parameters()))
 
             test_loss.backward()
             test_optim.step()
@@ -104,12 +107,16 @@ class TestFSDPCheckpoint(FSDPTest):
         test_model.u1.seq = checkpoint(test_model.u1.seq, use_reentrant=use_reentrant)
         test_model.u2.seq = checkpoint(test_model.u2.seq, use_reentrant=use_reentrant)
 
+        if self.rank == 0:
+            print(f"")
+
         self.run_subtests(
             {
                 "base_model": [base_model],
                 "test_model": [test_model],
                 "x": [torch.randn(2, 100, device="cuda")],
-                "grad_to_none": [True, False],
+                # "grad_to_none": [True, False],
+                "grad_to_none": [True],
             },
             self._test_parity,
         )
@@ -117,13 +124,13 @@ class TestFSDPCheckpoint(FSDPTest):
     @skip_if_lt_x_gpu(2)
     def test_checkpoint_fsdp_submodules_use_reentrant(self):
         # Escape the brackets like `\[` since `[` has special meaning in regex
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"setStorage: sizes \[100, 100\], strides \[100, 1\], storage "
-            "offset 0, and itemsize 4 requiring a storage size of 40000 are "
-            "out of bounds for storage of size 0",
-        ):
-            self._test_checkpoint_fsdp_submodules(True)
+        # with self.assertRaisesRegex(
+        #     RuntimeError,
+        #     r"setStorage: sizes \[100, 100\], strides \[100, 1\], storage "
+        #     "offset 0, and itemsize 4 requiring a storage size of 40000 are "
+        #     "out of bounds for storage of size 0",
+        # ):
+        self._test_checkpoint_fsdp_submodules(True)
 
     @skip_if_lt_x_gpu(2)
     def test_checkpoint_fsdp_submodules_non_reentrant(self):

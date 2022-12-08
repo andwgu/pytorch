@@ -1480,14 +1480,6 @@ class Module:
                 or _global_backward_pre_hooks or _global_backward_hooks
                 or _global_forward_hooks or _global_forward_pre_hooks):
             return forward_call(*args, **kwargs)
-        # Do not call functions when jit is used
-        full_backward_hooks, non_full_backward_hooks = [], []
-        backward_pre_hooks = []
-        if self._backward_pre_hooks or _global_backward_pre_hooks:
-            backward_pre_hooks = self._get_backward_pre_hooks()
-
-        if self._backward_hooks or _global_backward_hooks:
-            full_backward_hooks, non_full_backward_hooks = self._get_backward_hooks()
 
         if _global_forward_pre_hooks or self._forward_pre_hooks:
             for hook_id, hook in (
@@ -1510,6 +1502,15 @@ class Module:
                         if not isinstance(result, tuple):
                             result = (result,)
                         args = result
+
+        # Do not call functions when jit is used
+        full_backward_hooks, non_full_backward_hooks = [], []
+        backward_pre_hooks = []
+        if self._backward_pre_hooks or _global_backward_pre_hooks:
+            backward_pre_hooks = self._get_backward_pre_hooks()
+
+        if self._backward_hooks or _global_backward_hooks:
+            full_backward_hooks, non_full_backward_hooks = self._get_backward_hooks()
 
         bw_hook = None
         if full_backward_hooks or backward_pre_hooks:

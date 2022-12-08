@@ -99,9 +99,16 @@ class TestFSDPCheckpoint(FSDPTest):
 
         test_model = copy.deepcopy(model)
         test_model.u1 = fully_shard(test_model.u1, policy=None)
-        test_model.u2 = fully_shard(test_model.u2)
+        test_model.u2 = fully_shard(test_model.u2, policy=None)
+        if self.rank == 0:
+            print(f"[Rank 0] u1: {[id(h) for h in fully_shard.state(test_model.u1)._handles]}")
+            print(f"[Rank 0] u2: {[id(h) for h in fully_shard.state(test_model.u2)._handles]}")
+        # from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        # test_model.u1 = FSDP(test_model.u1, use_orig_params=True)
+        # test_model.u2 = FSDP(test_model.u2, use_orig_params=True)
 
-        test_model.u1.seq = checkpoint(test_model.u1.seq, use_reentrant=use_reentrant)
+        # test_model.u1.seq = checkpoint(test_model.u1.seq, use_reentrant=use_reentrant)
+        test_model.u1 = checkpoint(test_model.u1, use_reentrant=use_reentrant)
         test_model.u2.seq = checkpoint(test_model.u2.seq, use_reentrant=use_reentrant)
 
         self.run_subtests(
@@ -117,13 +124,13 @@ class TestFSDPCheckpoint(FSDPTest):
     @skip_if_lt_x_gpu(2)
     def test_checkpoint_fsdp_submodules_use_reentrant(self):
         # Escape the brackets like `\[` since `[` has special meaning in regex
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"setStorage: sizes \[100, 100\], strides \[100, 1\], storage "
-            "offset 0, and itemsize 4 requiring a storage size of 40000 are "
-            "out of bounds for storage of size 0",
-        ):
-            self._test_checkpoint_fsdp_submodules(True)
+        # with self.assertRaisesRegex(
+        #     RuntimeError,
+        #     r"setStorage: sizes \[100, 100\], strides \[100, 1\], storage "
+        #     "offset 0, and itemsize 4 requiring a storage size of 40000 are "
+        #     "out of bounds for storage of size 0",
+        # ):
+        self._test_checkpoint_fsdp_submodules(True)
 
     @skip_if_lt_x_gpu(2)
     def test_checkpoint_fsdp_submodules_non_reentrant(self):

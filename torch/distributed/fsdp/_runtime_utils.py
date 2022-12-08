@@ -44,6 +44,10 @@ RESHARD_AFTER_FORWARD_STRATEGIES = {
     HandleShardingStrategy.HYBRID_SHARD,
 }
 
+U1_OUT_TENSOR_ID = -1
+U2_OUT_TENSOR_ID = -1
+PRE_BACKWARD_HOOKS = []
+
 
 @no_type_check
 def _validate_hybrid_shard_setup(fsdp_root: _FSDPState, fsdp_module: nn.Module):
@@ -296,6 +300,8 @@ def _pre_forward(
         args (Tuple[Any, ...]): Module forward ``args``.
         kwargs (Dict[str, Any]): Module forward ``kwargs``.
     """
+    if state.rank == 0:
+        print(f"[Rank 0] _pre_forward_hook for {[(h.flat_param._fqns, id(h)) for h in handles]}")
     state.training_state = TrainingState.FORWARD_BACKWARD
     state._exec_order_data.record_pre_forward(handles, module.training)
     for handle in handles:
@@ -358,6 +364,8 @@ def _post_forward(
     Postcondition: Each ``FlatParameter`` 's data points to the sharded
     flattened parameter.
     """
+    if state.rank == 0:
+        print(f"[Rank 0] _post_forward_hook for {[(h.flat_param._fqns, id(h)) for h in handles]}")
     state._exec_order_data.record_post_forward(handles)
     if reshard_fn is not None:
         reshard_fn()
@@ -482,6 +490,15 @@ def _pre_backward_hook(
     *unused: Any,
 ) -> Any:
     """Prepares ``_handles`` 's ``FlatParameter`` s for gradient computation."""
+    if state.rank == 0:
+        print(f"[Rank 0] _pre_backward_hook for {[(h.flat_param._fqns, id(h)) for h in _handles]}")
+    if state.rank == 0:
+        import ctypes
+        global U1_OUT_TENSOR_ID
+        global U2_OUT_TENSOR_ID
+        # print(f"[Rank 0] u1 out tensor: {U1_OUT_TENSOR_ID} {ctypes.cast(U1_OUT_TENSOR_ID, ctypes.py_object).value}")  # print tensor
+        # print(f"[Rank 0] u2 out tensor: {U2_OUT_TENSOR_ID} {ctypes.cast(U2_OUT_TENSOR_ID, ctypes.py_object).value}")  # print tensor
+        print(f"[Rank 0] {PRE_BACKWARD_HOOKS}")
     _handles_key = tuple(_handles)  # avoid shadowing `handles_key`
     # Only run the pre-backward hook once per group of handles involved in the
     # same module forward computation
@@ -548,6 +565,8 @@ def _post_backward_hook(
     """
     flat_param = handle.flat_param
     flat_param._post_backward_called = True
+    if state.rank == 0:
+        print(f"[Rank 0] _post_backward_hook for {(handle.flat_param._fqns, id(handle))}")
     with torch.autograd.profiler.record_function(
         "FullyShardedDataParallel._post_backward_hook"
     ):
@@ -683,6 +702,13 @@ def _post_backward_hook(
                 # Delay using sharded gradient views until after the
                 # reduce-scatter instead of immediately after resharding
                 handle._use_sharded_grad_views()
+        if state.rank == 0:
+            import ctypes
+            global U1_OUT_TENSOR_ID
+            global U2_OUT_TENSOR_ID
+            # print(f"[Rank 0] u1 out tensor: {U1_OUT_TENSOR_ID} {ctypes.cast(U1_OUT_TENSOR_ID, ctypes.py_object).value}")  # print tensor
+            # print(f"[Rank 0] u2 out tensor: {U2_OUT_TENSOR_ID} {ctypes.cast(U2_OUT_TENSOR_ID, ctypes.py_object).value}")  # print tensor
+            print(f"[Rank 0] {PRE_BACKWARD_HOOKS}")
 
 
 @no_type_check
@@ -1066,6 +1092,8 @@ def _register_pre_backward_hooks(
         state._post_backward_callback_queued = False  # only defined on the root
 
     handles_key = tuple(handles)
+    if state.rank == 0:
+        print(f"[Rank 0] reg. pre-bwd hooks for {[(h.flat_param._fqns, id(h)) for h in handles]}")
     if handles_key:
         # Since these handles' `FlatParameter`s participated in a forward, we
         # conservatively assume that they will be used in the backward
@@ -1074,7 +1102,22 @@ def _register_pre_backward_hooks(
 
     def _register_hook(t: torch.Tensor) -> torch.Tensor:
         if t.requires_grad:
-            t.register_hook(functools.partial(_pre_backward_hook, state, handles))
+            if state.rank == 0:
+                print(f"[Rank 0] reg. pre-bwd hook on {id(t)} for {[(h.flat_param._fqns, id(h)) for h in handles]}")
+            global U1_OUT_TENSOR_ID
+            global U2_OUT_TENSOR_ID
+            global PRE_BACKWARD_HOOKS
+            if U1_OUT_TENSOR_ID == -1:  # rely on `u1` registers first (super hacky)
+                if state.rank == 0:
+                    print(f"[Rank 0] id(u1 out)={id(t)}")
+                U1_OUT_TENSOR_ID = id(t)
+            elif U2_OUT_TENSOR_ID == -1:
+                if state.rank == 0:
+                    print(f"[Rank 0] id(u2 out)={id(t)}")
+                U2_OUT_TENSOR_ID = id(t)
+            
+            hook = t.register_hook(functools.partial(_pre_backward_hook, state, handles))
+            PRE_BACKWARD_HOOKS.append(hook)
             state._needs_pre_backward_unshard[handles_key] = True
         return t
 

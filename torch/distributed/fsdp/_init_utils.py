@@ -49,7 +49,11 @@ from torch.distributed.fsdp.flat_param import (
     FlatParamHandle,
     HandleShardingStrategy,
 )
-from torch.distributed.fsdp.wrap import _ExecOrderBasePolicy, _FSDPPolicy
+from torch.distributed.fsdp.wrap import (
+    _ExecOrderBasePolicy,
+    _ExecOrderPolicy,
+    _FSDPPolicy,
+)
 from torch.distributed.utils import _sync_params_and_buffers
 from torch.utils.hooks import RemovableHandle
 
@@ -80,6 +84,7 @@ HYBRID_SHARDING_STRATEGIES = {
     ShardingStrategy.HYBRID_SHARD,
     ShardingStrategy._HYBRID_SHARD_ZERO2,
 }
+EXEC_ORDER_POLICIES = (_ExecOrderPolicy, _ExecOrderBasePolicy)
 
 
 # NOTE: Since non-self attributes cannot be type annotated, several attributes
@@ -303,6 +308,7 @@ def _init_core_state(
     state.cpu_offload = cpu_offload or CPUOffload()
     state.limit_all_gathers = limit_all_gathers
     state._use_orig_params = use_orig_params
+    state._use_exec_order = False
     state.training_state = TrainingState.IDLE
     state._is_root = None
     _streams: Dict[str, torch.cuda.Stream] = {}
@@ -446,8 +452,14 @@ def _init_param_handles_from_module(
     depending on ``policy``. See [Note: Fully Sharded Module].
     """
     # TODO (awgu): This is to gate the execution order code path.
-    if isinstance(policy, _ExecOrderBasePolicy):
+    if isinstance(policy, EXEC_ORDER_POLICIES):
         state._use_exec_order = True
+        if isinstance(policy, _ExecOrderPolicy):
+            state._exec_order_comm_size = policy._comm_size
+            # TODO: Move this to `_ExecOrderData` if we track the post-backward
+            # order there for other reasons.
+            handles_post_backward_order: List[FlatParamHandle] = []
+            state._handles_post_backward_order = handles_post_backward_order
     fully_sharded_module_to_states, _ = _get_fully_sharded_module_to_states(
         root_module,
         policy,
@@ -462,7 +474,7 @@ def _init_param_handles_from_module(
     # reverse topological sort order. This avoids increasing peak GPU memory
     # usage when the unsharded model exists on CPU or meta device.
     # NOTE: This order differs from that followed by the wrapper path when
-    # using auto wrapping, which also represents a valid reverse toplogical
+    # using auto wrapping, which also represents a valid reverse topological
     # sort order, but the difference does not matter.
     materialized_module = False
     for submodule in reversed(list(root_module.modules())):

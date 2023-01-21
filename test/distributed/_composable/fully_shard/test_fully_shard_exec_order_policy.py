@@ -6,14 +6,20 @@ import sys
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed._composable import fully_shard
-from torch.distributed.fsdp.wrap import ModuleWrapPolicy, _ExecOrderBasePolicy
-from torch.testing._internal.common_distributed import (
-    skip_if_lt_x_gpu,
+from torch.distributed.fsdp.wrap import (
+    _ExecOrderBasePolicy,
+    _ExecOrderPolicy,
+    ModuleWrapPolicy,
 )
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import (
+    CUDAInitMode,
+    FSDPInitMode,
     FSDPTest,
+    NestedWrappedModule,
+    TransformerWithSharedParams,
 )
 from torch.testing._internal.common_utils import run_tests, TEST_WITH_DEV_DBG_ASAN
 
@@ -70,11 +76,14 @@ class TestFSDPExecOrderPolicy(FSDPTest):
         with self.assertRaisesRegex(
             RuntimeError,
             "Only parent-child shared parameters are supported. FSDP found a "
-            "shared parameter between the two modules:"
+            "shared parameter between the two modules:",
         ):
             module_classes = {nn.Linear, nn.Embedding}
             fully_shard(
-                nn.Sequential(ModelWithSharedParams(), nn.Linear(d_vocab, d_vocab),),
+                nn.Sequential(
+                    ModelWithSharedParams(),
+                    nn.Linear(d_vocab, d_vocab),
+                ),
                 process_group=self.process_group,
                 policy=ModuleWrapPolicy(module_classes),
                 device_id=torch.cuda.current_device(),
@@ -84,7 +93,9 @@ class TestFSDPExecOrderPolicy(FSDPTest):
         composable_module = nn.Sequential(
             ModelWithSharedParams(), nn.Linear(d_vocab, d_vocab)
         )
-        ddp_module = DDP(copy.deepcopy(composable_module).cuda(), device_ids=[self.rank])
+        ddp_module = DDP(
+            copy.deepcopy(composable_module).cuda(), device_ids=[self.rank]
+        )
         fully_shard(
             composable_module,
             process_group=self.process_group,
@@ -110,12 +121,81 @@ class TestFSDPExecOrderPolicy(FSDPTest):
         composable_optim = torch.optim.Adam(composable_module.parameters(), lr=1e-2)
         for i in range(4):
             losses = []
-            for (module, optim) in ((ddp_module, ddp_optim), (composable_module, composable_optim)):
+            for (module, optim) in (
+                (ddp_module, ddp_optim),
+                (composable_module, composable_optim),
+            ):
                 optim.zero_grad(set_to_none=(i % 2 == 0))
                 inp = torch.arange(12, device=torch.device("cuda")).view(6, 2)
                 loss = module(inp).sum()
                 losses.append(loss)
                 loss.backward()
+                optim.step()
+            self.assertEqual(losses[0], losses[1])
+
+    @skip_if_lt_x_gpu(2)
+    def test_ddp_parity_for_nested_model(self):
+        """
+        Tests ``fully_shard`` parity with DDP when using ``_ExecOrderPolicy``
+        for a nested model.
+        """
+        model = NestedWrappedModule.init(
+            self.process_group,
+            FSDPInitMode.NO_FSDP,
+            CUDAInitMode.CUDA_BEFORE,
+            {},
+            deterministic=True,
+        )
+        ddp_model = DDP(copy.deepcopy(model), device_ids=[self.rank])
+        # Hand choose a size to group some but not all parameters together
+        comm_size = int(5e2)
+        fully_shard(
+            model,
+            process_group=self.process_group,
+            policy=_ExecOrderPolicy(comm_size),
+            device_id=torch.cuda.current_device(),
+        )
+        self._test_ddp_parity(ddp_model, model)
+
+    @skip_if_lt_x_gpu(2)
+    def test_ddp_parity_for_transformer_with_shared_params(self):
+        """
+        Tests ``fully_shard`` parity with DDP when using ``_ExecOrderPolicy``
+        for a transformer model with shared parameters.
+        """
+        model = TransformerWithSharedParams.init(
+            self.process_group,
+            FSDPInitMode.NO_FSDP,
+            CUDAInitMode.CUDA_BEFORE,
+            {},
+            deterministic=True,
+        )
+        ddp_model = DDP(copy.deepcopy(model), device_ids=[self.rank])
+        # Hand choose a size to group some but not all parameters together
+        comm_size = int(5e2)
+        fully_shard(
+            model,
+            process_group=self.process_group,
+            policy=_ExecOrderPolicy(comm_size),
+            device_id=torch.cuda.current_device(),
+        )
+        self._test_ddp_parity(ddp_model, model)
+
+    def _test_ddp_parity(self, ddp_model: DDP, fsdp_model: nn.Module):
+        LR = 1e-2
+        ddp_optim = torch.optim.Adam(ddp_model.parameters(), lr=LR)
+        fsdp_optim = torch.optim.Adam(fsdp_model.parameters(), lr=LR)
+        device = torch.device("cuda")
+        for i in range(6):
+            losses = []
+            inp = fsdp_model.get_input(device)
+            for model, optim in ((ddp_model, ddp_optim), (fsdp_model, fsdp_optim)):
+                optim.zero_grad(set_to_none=(i % 2 == 0))
+                out = model(*inp)
+                module = model.module if isinstance(model, DDP) else model
+                loss = module.get_loss(inp, out)
+                losses.append(loss)
+                module.run_backward(loss)
                 optim.step()
             self.assertEqual(losses[0], losses[1])
 

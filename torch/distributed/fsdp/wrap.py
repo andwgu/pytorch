@@ -110,6 +110,28 @@ class ModuleWrapPolicy(_FSDPPolicy):
         return super().__repr__() + f"({self._module_classes_str})"
 
 
+class _ExecOrderPolicy(_FSDPPolicy):
+    """
+    This FSDP policy uses the gradient-ready order to construct FSDP's
+    ``FlatParameter`` s according to ``comm_size``, which represents the target
+    communication size in bytes per collective call.
+    """
+
+    def __init__(self, comm_size: int):
+        """
+        Args:
+            comm_size (int): Target communication size in bytes per collective
+                call.
+        """
+        super().__init__()
+        self._policy: Callable = _exec_order_base_policy
+        self._comm_size = comm_size
+
+    @property
+    def policy(self):
+        return self._policy
+
+
 @no_type_check
 def _exec_order_base_policy(
     module: nn.Module,

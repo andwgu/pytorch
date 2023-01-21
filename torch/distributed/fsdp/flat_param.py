@@ -357,11 +357,15 @@ class FlatParamHandle:
         self._keep_low_precision_grads = keep_low_precision_grads
         self._training_state = HandleTrainingState.IDLE
         self._debug_level = dist.get_debug_level()
+        # TODO (awgu): This attribute loses its meaning upon rebucketing. It
+        # will be the root module.
         self._fully_sharded_module = fully_sharded_module
         self._init_flat_param(params, fully_sharded_module, use_orig_params)
         self._orig_param_dtype = self.flat_param.dtype
         self._use_unsharded_views(as_params=False)
         self._init_param_reduce_dtypes(mp_param_dtype, mp_reduce_dtype)
+        if self._use_orig_params:
+            self._use_unsharded_grad_views()
 
         # The following are used for the execution order policy
         self._root_modules = self._init_root_modules()
@@ -398,8 +402,9 @@ class FlatParamHandle:
         fqns: List[str] = []
         shared_param_infos: List[SharedParamInfo] = []
         shared_param_memo: Dict[nn.Parameter, Tuple[nn.Module, str, str]] = {}
-        params_to_flatten: List[Union[torch.Tensor, nn.Parameter]] = []
-        shared_params: List[Union[torch.Tensor, nn.Parameter]] = []
+        params_to_flatten: List[Union[Tensor, nn.Parameter]] = []
+        grads_to_flatten: List[Optional[Tensor]] = []
+        shared_params: List[Union[Tensor, nn.Parameter]] = []
         param_extensions: List[Any] = []
         dtype: Optional[torch.dtype] = None
         requires_grad: Optional[bool] = None
@@ -445,6 +450,7 @@ class FlatParamHandle:
                     requires_grad = param.requires_grad
                     shared_param_memo[param] = (submodule, submodule_name, param_name)
                     params_to_flatten.append(param)
+                    grads_to_flatten.append(param.grad)
                     param_infos.append(ParamInfo(param_name, submodule, submodule_name))
                     numels.append(param.numel())
                     shapes.append(param.shape)
@@ -461,11 +467,17 @@ class FlatParamHandle:
         self.flat_param = FlatParamHandle.flatten_params(
             params_to_flatten, requires_grad
         )
+        self.flat_param.grad = FlatParamHandle.flatten_grads(
+            grads_to_flatten,
+            shapes,
+            self.flat_param.dtype,
+            self.flat_param.device,
+        )
         # For `use_orig_params=True`, ensure that the logical parameters are
         # `nn.Parameter`s (and not plain `torch.Tensor`)
 
         def convert_to_params(
-            tensors: List[Union[torch.Tensor, nn.Parameter]]
+            tensors: List[Union[Tensor, nn.Parameter]]
         ) -> List[nn.Parameter]:
             return [
                 t if isinstance(t, nn.Parameter) else nn.Parameter(t) for t in tensors
@@ -484,7 +496,7 @@ class FlatParamHandle:
 
     @staticmethod
     def flatten_params(
-        params: Sequence[torch.Tensor],
+        params: Sequence[Tensor],
         requires_grad: bool,
     ) -> FlatParameter:
         """
@@ -504,6 +516,33 @@ class FlatParamHandle:
             flat_param_data = torch.cat(flat_params, dim=0)
         flat_param = FlatParameter(flat_param_data, requires_grad=requires_grad)
         return flat_param
+
+    @staticmethod
+    def flatten_grads(
+        grads: Sequence[Optional[Tensor]],
+        sizes: Sequence[torch.Size],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[Tensor]:
+        """
+        Flattens the gradients in ``grads`` into a single ``Tensor``. If all
+        gradients in ``grads`` are ``None``, then this returns ``None``.
+        Otherwise, if there are some gradients that are ``None`` (but not all),
+        then those ``None`` gradients are treated as zeros.
+        """
+        if all(grad is None for grad in grads):
+            return None
+        total_numel = sum(size.numel() for size in sizes)
+        flat_grad = torch.zeros((total_numel,), dtype=dtype, device=device)
+        offset = 0
+        for grad, size in zip(grads, sizes):
+            if grad is None:
+                continue  # use already-filled zeros
+            flat_grad[
+                offset : offset + size.numel()
+            ] = grad.flatten()  # no copy if contiguous
+            offset += size.numel()
+        return flat_grad
 
     def _init_param_reduce_dtypes(
         self,
@@ -569,12 +608,15 @@ class FlatParamHandle:
     ###################################
     # SHARD INITIALIZATION & METADATA #
     ###################################
+    @no_type_check
     @torch.no_grad()
     def shard(self):
         """
         Shards the handle's ``FlatParameter``. In terms of memory, this
         allocates new memory for the sharded flattened parameter and frees the
-        unsharded flattened parameter's storage.
+        unsharded flattened parameter's storage. If the unsharded
+        ``FlatParameter`` had an unsharded gradient, then that is also sharded
+        and re-assigned to the sharded ``FlatParameter``.
 
         Postcondition: ``self.flat_param`` is the sharded flattened parameter.
         Shard metadata attributes are set for all sharding strategies.
@@ -589,18 +631,40 @@ class FlatParamHandle:
                 flat_param.storage_offset() == 0,
                 "The `FlatParameter` is not the sole occupant of its storage",
             )
-            orig_storage = flat_param._typed_storage()
-            sharded_flat_param, numel_padded = FlatParamHandle._get_shard(
+            orig_flat_param_storage = flat_param._typed_storage()
+            has_grad = flat_param.grad is not None
+            orig_flat_grad_storage = (
+                flat_param.grad._typed_storage() if has_grad else None
+            )
+            sharded_flat_param, flat_param_numel_padded = FlatParamHandle._get_shard(
                 flat_param, self.rank, self.world_size
             )
+            if has_grad:
+                sharded_flat_grad, flat_grad_numel_padded = FlatParamHandle._get_shard(
+                    flat_param.grad, self.rank, self.world_size
+                )
+                flat_param.grad = None
+                p_assert(
+                    flat_param_numel_padded == flat_grad_numel_padded,
+                    "Expects same `FlatParameter` and gradient padding but "
+                    f"got {flat_param_numel_padded} vs. {flat_grad_numel_padded}",
+                )
             flat_param.set_(sharded_flat_param)  # type: ignore[call-overload]
+            if has_grad:
+                flat_param.grad = sharded_flat_grad
             start = sharded_flat_param.numel() * self.rank
             end = sharded_flat_param.numel() * (self.rank + 1) - 1  # inclusive
-            self._init_shard_metadata(numel_padded, start, end)
-            if orig_storage._size() > 0:
-                orig_storage._resize_(0)
+            self._init_shard_metadata(flat_param_numel_padded, start, end)
+            if orig_flat_param_storage._size() > 0:
+                orig_flat_param_storage._resize_(0)
+            if (
+                orig_flat_grad_storage is not None
+                and orig_flat_grad_storage._size() > 0
+            ):
+                orig_flat_grad_storage._resize_(0)
         if self._use_orig_params:
             self._use_sharded_views()
+            self._use_sharded_grad_views()
 
     def _init_shard_metadata(
         self,
@@ -873,6 +937,18 @@ class FlatParamHandle:
                 )
                 _free_storage(flat_param._full_prec_full_param_padded)
 
+    @no_type_check
+    def free_flat_param_sharded_attributes(self) -> None:
+        """
+        Frees the handle's ``FlatParameter`` 's sharded attributes that exist
+        on device.
+        """
+        flat_param = self.flat_param
+        if hasattr(flat_param, "_local_shard"):
+            _free_storage(flat_param._local_shard)
+        if hasattr(flat_param, "_mp_shard"):
+            _free_storage(flat_param._mp_shard)
+
     ###################
     # UNSHARD/RESHARD #
     ###################
@@ -971,7 +1047,7 @@ class FlatParamHandle:
         _alloc_storage(unsharded_flat_param, flat_param._padded_unsharded_size)  # type: ignore[attr-defined]
         return unsharded_flat_param
 
-    def _get_padded_unsharded_flat_param(self) -> torch.Tensor:
+    def _get_padded_unsharded_flat_param(self) -> Tensor:
         """
         Returns a reference to the padded unsharded flattened parameter
         depending on the calling context. This should only be called if using a
@@ -1020,7 +1096,7 @@ class FlatParamHandle:
 
     def _use_unsharded_flat_param(
         self,
-        padded_unsharded_flat_param: torch.Tensor,
+        padded_unsharded_flat_param: Tensor,
     ) -> None:
         """
         Switches to using the *unpadded* unsharded flattened parameter, which
@@ -1371,7 +1447,7 @@ class FlatParamHandle:
     @staticmethod
     def _get_unflat_views(
         flat_param: FlatParameter,
-        tensor: Optional[torch.Tensor] = None,
+        tensor: Optional[Tensor] = None,
     ) -> Iterator[Tensor]:
         """
         Returns unflattened ``Tensor`` views into ``tensor`` if it is not
@@ -1965,7 +2041,9 @@ class FlatParamHandle:
             _p_assert(
                 flat_param.grad is None
                 or not self.uses_sharded_strategy
-                or self._training_state == HandleTrainingState.FORWARD,
+                or self._training_state == HandleTrainingState.FORWARD
+                or self._training_state
+                == HandleTrainingState.IDLE,  # TODO (awgu): for exec order
                 "Sharded strategies should use `_cpu_grad` or `_saved_grad_shard` "
                 "unless in FORWARD (for the post-forward reshard)",
             )

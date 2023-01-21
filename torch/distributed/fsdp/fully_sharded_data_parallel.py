@@ -100,7 +100,7 @@ from ._unshard_param_utils import (
     _unshard_params_recurse,
 )
 from .flat_param import FlatParameter
-from .wrap import _FSDPPolicy
+from .wrap import _ExecOrderBasePolicy, _FSDPPolicy
 
 
 __all__ = [
@@ -361,6 +361,8 @@ class FullyShardedDataParallel(nn.Module, _FSDPState):
             self, process_group, sharding_strategy, auto_wrap_policy
         )
         if auto_wrap_policy is not None:
+            if isinstance(auto_wrap_policy, _ExecOrderBasePolicy):
+                raise ValueError("`_ExecOrderBasePolicy` is not supported yet")
             auto_wrap_kwargs = {
                 "module": module,
                 "auto_wrap_policy": auto_wrap_policy,
@@ -734,8 +736,12 @@ class FullyShardedDataParallel(nn.Module, _FSDPState):
         ):
             args, kwargs = _root_pre_forward(self, self, args, kwargs)
             unused = None
-            unshard_fn = functools.partial(_pre_forward_unshard, self, self._handles)
-            reshard_fn = functools.partial(_post_forward_reshard, self, self._handles)
+            unshard_fn = functools.partial(
+                _pre_forward_unshard, self, self._handles, self
+            )
+            reshard_fn = functools.partial(
+                _post_forward_reshard, self, self._handles, self
+            )
             args, kwargs = _pre_forward(
                 self, self._handles, unshard_fn, self._fsdp_wrapped_module, args, kwargs
             )

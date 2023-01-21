@@ -425,11 +425,26 @@ def _pre_forward(
 def _pre_forward_unshard(
     state: _FSDPState,
     handles: List[FlatParamHandle],
+    module: nn.Module,
 ) -> None:
     """Unshards parameters in the pre-forward."""
-    if not handles:
+    handles_to_unshard = (
+        tuple(handle for handle in handles if len(handle._active_modules) == 0)
+        if state._use_exec_order
+        else handles
+    )
+    if not handles_to_unshard:
         return
-    _unshard(state, handles, state._streams["unshard"], state._streams["pre_unshard"])
+    if state._use_exec_order:
+        for handle in handles_to_unshard:
+            handle._active_modules.add(module)
+    _unshard(
+        state,
+        handles_to_unshard,
+        state._streams["unshard"],
+        state._streams["pre_unshard"],
+    )
+    # TODO (awgu): Should we key on the handles to unshard or all handles?
     handles_key = tuple(handles)
     state._needs_pre_forward_unshard[handles_key] = False
     torch.cuda.current_stream().wait_stream(state._streams["unshard"])
@@ -482,20 +497,32 @@ def _post_forward(
 def _post_forward_reshard(
     state: _FSDPState,
     handles: List[FlatParamHandle],
+    module: nn.Module,
 ) -> None:
     """Reshards parameters in the post-forward."""
     if not handles:
         return
+    if state._use_exec_order:
+        handles_to_reshard: List[FlatParamHandle] = []
+        for handle in handles:
+            p_assert(
+                module in handle._active_modules,
+                "Module missing from `_active_modules`",
+            )
+            handle._active_modules.remove(module)
+            if len(handle._active_modules) == 0:
+                handles_to_reshard.append(handle)
+    else:
+        handles_to_reshard = handles
     # Do not free the root's parameters in the post-forward for `FULL_SHARD`
     # with the intention that they are immediately used for backward
     # computation (though this may not be true)
-
     free_unsharded_flat_params = [
         not state._is_root
         and handle._sharding_strategy in RESHARD_AFTER_FORWARD_STRATEGIES
-        for handle in handles
+        for handle in handles_to_reshard
     ]
-    _reshard(state, handles, free_unsharded_flat_params)
+    _reshard(state, handles_to_reshard, free_unsharded_flat_params)
 
 
 @no_type_check
@@ -626,10 +653,21 @@ def _pre_backward_hook(
         for handle in _handles:
             handle._training_state = HandleTrainingState.BACKWARD_PRE
 
+        handles_to_unshard = (
+            tuple(handle for handle in _handles if len(handle._active_modules) == 0)
+            if state._use_exec_order
+            else _handles
+        )
+        if state._use_exec_order:
+            for handle in handles_to_unshard:
+                handle._active_modules.add(module)
         # If the handles have been prefetched, this `_unshard()` simply
         # switches to using the unsharded parameter
         _unshard(
-            state, _handles, state._streams["unshard"], state._streams["pre_unshard"]
+            state,
+            handles_to_unshard,
+            state._streams["unshard"],
+            state._streams["pre_unshard"],
         )
         torch.cuda.current_stream().wait_stream(state._streams["unshard"])
 
@@ -683,6 +721,15 @@ def _post_backward_hook(
         if flat_param.grad.requires_grad:
             raise RuntimeError("FSDP does not support gradients of gradients")
 
+        if state._use_exec_order:
+            p_assert(
+                len(handle._active_modules) <= len(handle._root_modules),
+                f"Number of active modules: {len(handle._active_modules)}\n"
+                f"Number of root modules: {len(handle._root_modules)}",
+            )
+            # The autograd engine takes care of the logical stack of active
+            # modules in that we should always reshard here.
+            handle._active_modules.clear()
         free_unsharded_flat_param = _should_free_in_backward(state, handle)
         _reshard(state, [handle], [free_unsharded_flat_param])
 
@@ -1093,6 +1140,7 @@ def _register_pre_forward_hooks(
                 _pre_forward_unshard,
                 state,
                 module_param_handles,
+                module,
             )
             hook = functools.partial(
                 _pre_forward, state, module_param_handles, unshard_fn
@@ -1123,6 +1171,7 @@ def _register_post_forward_hooks(
                 _post_forward_reshard,
                 state,
                 module_param_handles,
+                module,
             )
             hook = functools.partial(
                 _post_forward,

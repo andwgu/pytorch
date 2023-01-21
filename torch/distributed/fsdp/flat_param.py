@@ -363,6 +363,10 @@ class FlatParamHandle:
         self._use_unsharded_views(as_params=False)
         self._init_param_reduce_dtypes(mp_param_dtype, mp_reduce_dtype)
 
+        # The following are used for the execution order policy
+        self._root_modules = self._init_root_modules()
+        self._active_modules: Set[nn.Module] = set()
+
     def _init_flat_param(
         self,
         params: Sequence[Optional[nn.Parameter]],
@@ -533,6 +537,34 @@ class FlatParamHandle:
             self._reduce_dtype = mp_reduce_dtype or self._orig_param_dtype
         assert self._fwd_bwd_param_dtype is not None
         assert self._reduce_dtype is not None
+
+    def _init_root_modules(self) -> Set[nn.Module]:
+        """
+        Returns the subset of root modules among the set of modules that own
+        parameters managed by this handle. A "root module" is one that does not
+        have a parent module present in the aforementioned set.
+        """
+        param_infos = self.flat_param._param_infos
+        shared_param_infos = self.flat_param._shared_param_infos
+        all_modules: Set[nn.Module] = set()
+        for param_info in param_infos:
+            all_modules.add(param_info.module)
+        for shared_param_info in shared_param_infos:
+            all_modules.add(shared_param_info.module)
+        root_modules: Set[nn.Module] = set()
+        module_to_submodules = {module: set(module.modules()) for module in all_modules}
+        for candidate_module in all_modules:
+            is_root_module = True
+            for module, submodules in module_to_submodules.items():
+                is_child_module = (
+                    candidate_module is not module and candidate_module in submodules
+                )
+                if is_child_module:
+                    is_root_module = False
+                    break
+            if is_root_module:
+                root_modules.add(candidate_module)
+        return root_modules
 
     ###################################
     # SHARD INITIALIZATION & METADATA #

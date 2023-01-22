@@ -100,6 +100,7 @@ class ModuleWrapPolicy(_FSDPPolicy):
             _module_wrap_policy,
             module_classes=module_classes,
         )
+        self._module_classes = module_classes
         self._module_classes_str = str(module_classes)
 
     @property
@@ -117,15 +118,28 @@ class _ExecOrderPolicy(_FSDPPolicy):
     communication size in bytes per collective call.
     """
 
-    def __init__(self, comm_size: int):
+    def __init__(
+        self,
+        comm_size: int,
+        *,
+        module_classes: Optional[Set[Type[nn.Module]]] = None,
+        checkpoint_activations: bool = False,
+    ):
         """
         Args:
             comm_size (int): Target communication size in bytes per collective
                 call.
         """
         super().__init__()
-        self._policy: Callable = _exec_order_base_policy
+        if module_classes is None:
+            self._policy = _exec_order_base_policy
+        else:
+            self._policy = functools.partial(
+                _module_wrap_policy,
+                module_classes=module_classes,
+            )
         self._comm_size = comm_size
+        self._checkpoint_activations = checkpoint_activations
 
     @property
     def policy(self):
@@ -160,9 +174,20 @@ class _ExecOrderBasePolicy(_FSDPPolicy):
     testing.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        module_classes: Optional[Set[Type[nn.Module]]] = None,
+        checkpoint_activations: bool = False,
+    ):
         super().__init__()
-        self._policy = _exec_order_base_policy
+        if module_classes is None:
+            self._policy = _exec_order_base_policy
+        else:
+            self._policy = functools.partial(
+                _module_wrap_policy,
+                module_classes=module_classes,
+            )
+        self._checkpoint_activations = checkpoint_activations
 
     @property
     def policy(self):

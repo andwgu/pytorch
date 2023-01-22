@@ -21,7 +21,12 @@ from torch.testing._internal.common_fsdp import (
     NestedWrappedModule,
     TransformerWithSharedParams,
 )
-from torch.testing._internal.common_utils import run_tests, TEST_WITH_DEV_DBG_ASAN
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+    TEST_WITH_DEV_DBG_ASAN,
+)
 
 if not dist.is_available():
     print("Distributed not available, skipping tests", file=sys.stderr)
@@ -134,7 +139,8 @@ class TestFSDPExecOrderPolicy(FSDPTest):
             self.assertEqual(losses[0], losses[1])
 
     @skip_if_lt_x_gpu(2)
-    def test_ddp_parity_for_nested_model(self):
+    @parametrize("checkpoint_activations", [False, True])
+    def test_ddp_parity_for_nested_model(self, checkpoint_activations: bool):
         """
         Tests ``fully_shard`` parity with DDP when using ``_ExecOrderPolicy``
         for a nested model.
@@ -152,13 +158,18 @@ class TestFSDPExecOrderPolicy(FSDPTest):
         fully_shard(
             model,
             process_group=self.process_group,
-            policy=_ExecOrderPolicy(comm_size),
+            policy=_ExecOrderPolicy(
+                comm_size, checkpoint_activations=checkpoint_activations
+            ),
             device_id=torch.cuda.current_device(),
         )
         self._test_ddp_parity(ddp_model, model)
 
     @skip_if_lt_x_gpu(2)
-    def test_ddp_parity_for_transformer_with_shared_params(self):
+    @parametrize("checkpoint_activations", [False, True])
+    def test_ddp_parity_for_transformer_with_shared_params(
+        self, checkpoint_activations: bool
+    ):
         """
         Tests ``fully_shard`` parity with DDP when using ``_ExecOrderPolicy``
         for a transformer model with shared parameters.
@@ -176,7 +187,9 @@ class TestFSDPExecOrderPolicy(FSDPTest):
         fully_shard(
             model,
             process_group=self.process_group,
-            policy=_ExecOrderPolicy(comm_size),
+            policy=_ExecOrderPolicy(
+                comm_size, checkpoint_activations=checkpoint_activations
+            ),
             device_id=torch.cuda.current_device(),
         )
         self._test_ddp_parity(ddp_model, model)
@@ -187,6 +200,8 @@ class TestFSDPExecOrderPolicy(FSDPTest):
         fsdp_optim = torch.optim.Adam(fsdp_model.parameters(), lr=LR)
         device = torch.device("cuda")
         for i in range(6):
+            if self.rank == 0:
+                print(f"Iteration {i}!")
             losses = []
             inp = fsdp_model.get_input(device)
             for model, optim in ((ddp_model, ddp_optim), (fsdp_model, fsdp_optim)):
@@ -199,6 +214,8 @@ class TestFSDPExecOrderPolicy(FSDPTest):
                 optim.step()
             self.assertEqual(losses[0], losses[1])
 
+
+instantiate_parametrized_tests(TestFSDPExecOrderPolicy)
 
 if __name__ == "__main__":
     run_tests()

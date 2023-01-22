@@ -415,6 +415,9 @@ def _pre_forward(
         args (Tuple[Any, ...]): Module forward ``args``.
         kwargs (Dict[str, Any]): Module forward ``kwargs``.
     """
+    handle_training_state = _get_training_state(tuple(handles))
+    if handle_training_state == HandleTrainingState.BACKWARD_PRE:  # AC
+        return args, kwargs
     state.training_state = TrainingState.FORWARD_BACKWARD
     state._exec_order_data.record_pre_forward(handles, module.training)
     for handle in handles:
@@ -493,6 +496,9 @@ def _post_forward(
     Postcondition: Each ``FlatParameter`` 's data points to the sharded
     flattened parameter.
     """
+    handle_training_state = _get_training_state(tuple(handles))
+    if handle_training_state == HandleTrainingState.BACKWARD_PRE:  # AC
+        return output
     state._exec_order_data.record_post_forward(handles)
     if reshard_fn is not None:
         reshard_fn()
@@ -991,7 +997,9 @@ def _post_backward_final_callback(
     # iteration, we must try to keep bucketing in subsequent iterations and
     # detect when all handles have been bucketed.
     if state._use_exec_order and is_first_iter:
-        _reinit_flat_param_handles(root_state, root_module)
+        # TODO (awgu): Use hack to differentiate base policy from real policy.
+        if hasattr(state, "_exec_order_comm_size"):
+            _reinit_flat_param_handles(root_state, root_module)
 
 
 @no_type_check
@@ -1078,14 +1086,18 @@ def _reinit_flat_param_handles(
         print("Bucketed:")
         for bucket in handles_per_flat_param:
             print(
-                f"Bucket (size {len(bucket)}):\n"
-                f"{[h.flat_param._fqns for h in bucket]}"
+                f"Bucket (size {len(bucket)})"
+                # f":\n{[h.flat_param._fqns for h in bucket]}"
             )
     for fsdp_state in traversal_utils._get_fsdp_states(root_module):
         if hasattr(fsdp_state, "_handles_post_backward_order"):
             fsdp_state._handles_post_backward_order.clear()
             delattr(fsdp_state, "_handles_post_backward_order")
     _init_param_handles_from_handles(root_state, handles_per_flat_param)
+    # if root_state.rank == 0:
+    #     snapshot = torch.cuda.memory._snapshot()
+    #     from pickle import dump
+    #     dump(snapshot, open('snapshot.pickle', 'wb'))
 
 
 @no_type_check
@@ -1504,6 +1516,14 @@ def _init_param_handles_from_handles(
     )
     root_module = state._root_module
     for old_handles in handles_per_flat_param:
+        if state._exec_order_checkpoint_activations:
+            for old_handle in old_handles:
+                # NOTE: We assume that the fully sharded module is well-defined
+                # for the pre-bucketed construction and that we exactly
+                # checkpointed those modules.
+                torch.distributed._composable.checkpoint_activation._uncheckpoint(
+                    old_handle._fully_sharded_module
+                )
         computation_stream = state._streams["default"]
         _p_assert(
             computation_stream == torch.cuda.current_stream(),
@@ -1513,6 +1533,9 @@ def _init_param_handles_from_handles(
         # TODO: To save peak memory, we may be able to unshard the parameters,
         # construct the new `FlatParameter`, shard, and then repeat for the
         # gradients instead unsharding parameters and gradients simultaneously.
+        # TODO (awgu): Use hack to force full precision.
+        for old_handle in old_handles:
+            old_handle._training_state = HandleTrainingState.SUMMON_FULL_PARAMS
         _unshard(state, old_handles, computation_stream, computation_stream)
         _unshard_grads(old_handles)
         orig_params: List[nn.Parameter] = []
@@ -1527,8 +1550,21 @@ def _init_param_handles_from_handles(
         # This mainly has implications on model checkpointing, which needs to
         # be rewritten for this code path anyway.
         _init_param_handle_from_params(state, orig_params, root_module)
+        for old_handle in old_handles:
+            old_handle.free_flat_param_unsharded_attributes()
+            computation_stream.synchronize()  # free memory immediately
+            del old_handle
     for handle in state._handles:
         handle.init_flat_param_attributes()
+    if state._exec_order_checkpoint_activations:
+        for handle in state._handles:
+            # NOTE: As a heuristic, we checkpoint each handle's root modules.
+            for handle_root_module in handle._root_modules:
+                if state.rank == 0:
+                    print(f"Checkpoint {handle_root_module}")
+                torch.distributed._composable.checkpoint(
+                    handle_root_module, use_reentrant=False
+                )
     # Re-register forward hooks since the handle construction changed
     modules = list(root_module.modules())
     _register_pre_forward_hooks(state, modules)
@@ -1543,8 +1579,13 @@ def _bucket_param_handles(
     """
     Buckets the ``FlatParamHandle`` s in ``handles_post_backward_order``
     according to the bucket size threshold ``bucket_size``. A bucket (i.e. a
-    group of ``FlatParamHandle`` s) is finalized when its total size is at
-    least ``bucket_size``, and we move onto a new bucket.
+    group of handles) is finalized when its total size is at least
+    ``bucket_size``, at which point we proceed to the constructing the next
+    bucket.
+
+    NOTE: The bucket size is in terms of the full precision size even if mixed
+    precision is enabled, and it is with respect to the sharded size, not the
+    unsharded size.
     """
     handles_per_flat_param: List[List[FlatParamHandle]] = []
     curr_bucket_handles: List[FlatParamHandle] = []

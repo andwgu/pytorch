@@ -454,12 +454,13 @@ def _init_param_handles_from_module(
     # TODO (awgu): This is to gate the execution order code path.
     if isinstance(policy, EXEC_ORDER_POLICIES):
         state._use_exec_order = True
+        state._exec_order_checkpoint_activations = policy._checkpoint_activations
         if isinstance(policy, _ExecOrderPolicy):
             state._exec_order_comm_size = policy._comm_size
-            # TODO: Move this to `_ExecOrderData` if we track the post-backward
-            # order there for other reasons.
-            handles_post_backward_order: List[FlatParamHandle] = []
-            state._handles_post_backward_order = handles_post_backward_order
+        # TODO: Move this to `_ExecOrderData` if we track the post-backward
+        # order there for other reasons.
+        handles_post_backward_order: List[FlatParamHandle] = []
+        state._handles_post_backward_order = handles_post_backward_order
     fully_sharded_module_to_states, _ = _get_fully_sharded_module_to_states(
         root_module,
         policy,
@@ -525,6 +526,21 @@ def _init_param_handles_from_module(
         if sync_module_states:
             _sync_module_states(params, buffers, state.process_group)
         _init_param_handle_from_params(state, params, fully_sharded_module)
+    if state._use_exec_order and getattr(
+        state, "_exec_order_checkpoint_activations", False
+    ):
+        if state.rank == 0:
+            for fully_sharded_module in fully_sharded_module_to_states:
+                print(f"Wrapping: {type(fully_sharded_module)}")
+        modules_to_checkpoint = _get_modules_to_checkpoint(
+            fully_sharded_module_to_states.keys()
+        )
+        for module_to_checkpoint in modules_to_checkpoint:
+            if state.rank == 0:
+                print(f"Checkpointing: {type(module_to_checkpoint)}")
+            torch.distributed._composable.checkpoint(
+                module_to_checkpoint, use_reentrant=True
+            )
     # Reverse `_handles` to preserve depth-first `.modules()` order for
     # consistency with the wrapper path (namely, so that `_get_fsdp_handles()`
     # returns the same ordering for both paths).
@@ -557,6 +573,17 @@ def _init_param_handle_from_params(
     state.params.append(handle.flat_param)
     state._handles.append(handle)
     if state._use_exec_order:
+        print("Root modules:", handle._root_modules)
+    if state._use_exec_order:
+        # if False:
+        # TODO (awgu): The current computation of `_root_modules` is highly
+        # inefficient for the pre-bucketed phase when there is a parent module
+        # without any parameters that owns several child modules. In that case,
+        # all child modules are considered root modules and have pre/post-
+        # forward hooks registered. This kind of logic is necessary for the
+        # post-bucketed phase, but we may need to break up the pre/post-forward
+        # hooks to return earlier if the hook should be a no-op. The current
+        # CPU overhead is too high.
         # For this path, multiple module keys can share the same handle value
         for module in handle._root_modules:
             state._fully_sharded_module_to_handles[module].append(handle)
@@ -605,6 +632,27 @@ def _get_state_names_for_states(
         ), f"Buffer not in the module tree:\n{module}\n{buffer}"
         buffer_names.append(buffer_to_buffer_name[buffer])
     return param_names, buffer_names
+
+
+def _get_modules_to_checkpoint(modules: Iterable[nn.Module]):
+    """
+    Returns the set of modules to checkpoint for the pre-bucketing phase in the
+    execution order policy. These are the leaf modules with respect to the set
+    ``modules``.
+    """
+    modules_set = set(modules)
+    # Checkpoint modules that do not have any child in `modules_set`
+    modules_to_checkpoint: Set[nn.Module] = set()
+    # TODO (awgu): Consider optimizing this quadratic algorithm.
+    for module in modules_set:
+        has_child_in_modules_set = False
+        for submodule in module.modules():
+            if submodule is not module and submodule in modules_set:
+                has_child_in_modules_set = True
+                break
+        if not has_child_in_modules_set:
+            modules_to_checkpoint.add(module)
+    return modules_to_checkpoint
 
 
 def _get_ignored_modules(

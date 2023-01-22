@@ -110,6 +110,12 @@ class _ExecOrderData:
             current_handles_key, None
         )
         if current_index is None:
+            raise AssertionError(
+                "Backward is running for a handles key that did not participate "
+                "in the forward. This typically involves reentrant activation "
+                "checkpointing, in which case the post-backward final callback "
+                "ran early, clearing the recorded post-forward handles order."
+            )
             return None
         target_index = current_index - 1
         target_handles_keys: List[_HandlesKey] = []

@@ -184,6 +184,10 @@ def _get_fully_sharded_module_to_states(
             # another module.
             params.extend(lca_module_to_shared_params.get(module, []))
             lca_module_to_shared_params.pop(module, None)
+        # Shared modules may appear more than once in `wrapped_modules`, in
+        # which case the parameters are already assigned in the first visit
+        if fully_sharded_module in fully_sharded_module_to_states:
+            continue
         fully_sharded_module_to_states[fully_sharded_module] = FullyShardedModuleState(
             params, buffers
         )

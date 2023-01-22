@@ -369,6 +369,7 @@ class FlatParamHandle:
 
         # The following are used for the execution order policy
         self._root_modules = self._init_root_modules()
+        # TODO (awgu): This can be a list in theory.
         self._active_modules: Set[nn.Module] = set()
 
     def _init_flat_param(
@@ -948,6 +949,14 @@ class FlatParamHandle:
             _free_storage(flat_param._local_shard)
         if hasattr(flat_param, "_mp_shard"):
             _free_storage(flat_param._mp_shard)
+
+    @no_type_check
+    def free_flat_param_unsharded_attributes(self) -> None:
+        flat_param = self.flat_param
+        if hasattr(flat_param, "_full_param_padded"):
+            _free_storage(flat_param._full_param_padded)
+        if hasattr(flat_param, "_full_prec_full_param_padded"):
+            _free_storage(flat_param._full_prec_full_param_padded)
 
     ###################
     # UNSHARD/RESHARD #

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import detach_variable, get_device_states, set_device_states
 
-from .contract import contract
+from .contract import contract, REGISTRY_KEY, STATE_KEY
 
 
 @contextmanager
@@ -271,8 +271,48 @@ def checkpoint(module: nn.Module, *, use_reentrant: bool = True) -> nn.Module:
     #    activations during the backward pass.
     checkpoint.state(module).enable_hook = True
     checkpoint.state(module).use_reentrant = use_reentrant
-    module.register_forward_pre_hook(forward_pre_hook)
+    pre_forward_hook = module.register_forward_pre_hook(forward_pre_hook)
     # Use prepend to make sure we restore the original grad enabled state right
     # after the module forward invocation.
-    module.register_forward_hook(forward_hook, prepend=True)
+    post_forward_hook = module.register_forward_hook(forward_hook, prepend=True)
+    checkpoint.state(module)._pre_forward_hook = pre_forward_hook
+    checkpoint.state(module)._post_forward_hook = post_forward_hook
+    return module
+
+
+def _uncheckpoint(module: nn.Module) -> nn.Module:
+    """
+    This uncheckpoints a module that was checkpointed via :func:`checkpoint`.
+    If the module was not checkpointed, then this function is a no-op.
+    """
+    has_checkpoint_pre_forward_hook = hasattr(
+        checkpoint.state(module), "_pre_forward_hook"
+    )
+    has_checkpoint_post_forward_hook = hasattr(
+        checkpoint.state(module), "_post_forward_hook"
+    )
+    assert has_checkpoint_pre_forward_hook == has_checkpoint_post_forward_hook
+    is_checkpointed = has_checkpoint_pre_forward_hook
+    if is_checkpointed:
+        pre_forward_hook = checkpoint.state(module)._pre_forward_hook
+        pre_forward_hook.remove()
+        delattr(checkpoint.state(module), "_pre_forward_hook")
+        post_forward_hook = checkpoint.state(module)._post_forward_hook
+        post_forward_hook.remove()
+        delattr(checkpoint.state(module), "_post_forward_hook")
+    # Remove the module's state entry and registry entry *after* removing the
+    # forward hooks
+    if STATE_KEY in module.__dict__:
+        # TODO (awgu): Hack to pop because the address of `checkpoint` changes
+        # for some reason. E.g. key in the dict is 0x7fa24e357940 but accessing
+        # `checkpoint` here gives 0x7fa24e3579d0.
+        func_to_pop = None
+        for func in module.__dict__[STATE_KEY]:
+            if func.__name__ == "checkpoint":
+                func_to_pop = func
+                break
+        if func_to_pop is not None:
+            module.__dict__[STATE_KEY].pop(func_to_pop)
+    if REGISTRY_KEY in module.__dict__:
+        module.__dict__[REGISTRY_KEY].pop(checkpoint.__name__, None)
     return module

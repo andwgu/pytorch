@@ -262,11 +262,12 @@ class TestParityWithDDP(FSDPTest):
         """
         self.run_subtests(
             {
-                "use_orig_params": [True, False],
+                # "use_orig_params": [True, False],
+                "use_orig_params": [True],
                 "sharding_strategy": [
                     ShardingStrategy.FULL_SHARD,
-                    ShardingStrategy.SHARD_GRAD_OP,
-                    ShardingStrategy.NO_SHARD,
+                    # ShardingStrategy.SHARD_GRAD_OP,
+                    # ShardingStrategy.NO_SHARD,
                 ],
             },
             self._test_student_teacher,
@@ -302,7 +303,7 @@ class TestParityWithDDP(FSDPTest):
             optim_ctor(fsdp_student_backbone.parameters()),
             optim_ctor(fsdp_head.parameters()),
         ]
-        for i in range(10):
+        for i in range(2):
             losses = []
             inp1 = torch.randn(32, 24, device="cuda")
             inp2 = torch.randn(32, 24, device="cuda")

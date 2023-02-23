@@ -578,6 +578,7 @@ def _cast_fp_inputs_to_dtype(
     def cast_fn(x: torch.Tensor) -> torch.Tensor:
         if not torch.is_floating_point(x) or x.dtype == dtype:
             return x
+        print(f"[Rank {torch.distributed.get_rank()}] casting x from {x.dtype} to {dtype}")
         return x.to(dtype)
 
     return (_apply_to_tensors(cast_fn, args), _apply_to_tensors(cast_fn, kwargs))
@@ -597,6 +598,7 @@ def _pre_backward_hook(
         module (nn.Module): Fully sharded module (see [Note: Fully Sharded
             Module]).
     """
+    print(f"[Rank {state.rank}] pre-backward hook for {_handles}")
     _handles_key = tuple(_handles)  # avoid shadowing `handles_key`
     # Only run the pre-backward hook once per group of handles involved in the
     # same module forward computation
@@ -661,6 +663,7 @@ def _post_backward_hook(
     - Otherwise, the ``_saved_grad_shard`` attribute is the reduced sharded
     gradient (accumulating with any existing gradient).
     """
+    print(f"[Rank {state.rank}] post-backward hook for {handle}")
     flat_param = handle.flat_param
     flat_param._post_backward_called = True
     with torch.autograd.profiler.record_function(
@@ -891,6 +894,7 @@ def _post_backward_final_callback(
     This runs at the end of the entire backward pass and should only be called
     on the root FSDP instance.
     """
+    print(f"[Rank {state.rank}] post-backward final callback for {id(state)}")
     _p_assert(
         state._is_root,
         "The post-backward callback should only be called on the root FSDP instance",
@@ -946,7 +950,12 @@ def _catch_all_reshard(
             free_unsharded_flat_params.append(_should_free_in_backward(state, handle))
             handles_to_reshard.append(handle)
         if handles_to_reshard:
+            print(f"[Rank {state.rank}] catch all reshard on {handles_to_reshard}\n{[(handle.flat_param.grad.shape, handle.flat_param._unpadded_unsharded_size) if handle.flat_param.grad is not None else None for handle in handles_to_reshard]}")
             _reshard(state, handles_to_reshard, free_unsharded_flat_params)
+            for handle in handles_to_reshard:
+                if handle._use_orig_params:
+                    print(f"[Rank {state.rank}] use sharded grad views for {handle}")
+                    handle._use_sharded_grad_views()
     except Exception as e:
         _p_assert(
             False,
@@ -1231,8 +1240,12 @@ def _register_post_backward_hooks(
     for handle in handles:
         flat_param = handle.flat_param
         already_registered = hasattr(flat_param, "_post_backward_hook_state")
-        if already_registered or not flat_param.requires_grad:
+        if already_registered:
+            print(f"[Rank {state.rank}] already registered post-backward hook for {handle}")
+        # if already_registered or not flat_param.requires_grad:
+        if not flat_param.requires_grad:
             continue
+        print(f"[Rank {state.rank}] register post-backward hook for {handle}")
         # Get the `AccumulateGrad` object
         temp_flat_param = flat_param.expand_as(flat_param)
         _p_assert(

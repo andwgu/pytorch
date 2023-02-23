@@ -1124,6 +1124,7 @@ class FlatParamHandle:
         clearing any existing sharded gradient in ``.grad`` to enable computing
         a new unsharded gradient.
         """
+        print(f"[Rank {self.rank}] prepare gradient for backward for {self}")
         _p_assert(
             self._training_state
             in (HandleTrainingState.BACKWARD_PRE, HandleTrainingState.IDLE),
@@ -1152,6 +1153,7 @@ class FlatParamHandle:
                 # between a CPU tensor (the existing sharded gradient) and
                 # a GPU tensor (the new sharded gradient).
                 if not grad_offloaded:
+                    print(f"[Rank {self.rank}] save to _saved_grad_shard")
                     flat_param._saved_grad_shard = flat_param.grad.data  # type: ignore[attr-defined]
                     sharded_grad = flat_param._saved_grad_shard  # type: ignore[attr-defined]
                 else:
@@ -1174,6 +1176,7 @@ class FlatParamHandle:
                 ):
                     sharded_grad.data = sharded_grad.to(local_shard_dtype)
             else:
+                print(f"[Rank {self.rank}] did not save to _saved_grad_shard since grad does not have sharded size")
                 padded_unsharded_size = flat_param._padded_unsharded_size  # type: ignore[attr-defined]
                 _p_assert(
                     flat_param.grad.size() == padded_unsharded_size,
@@ -1182,6 +1185,8 @@ class FlatParamHandle:
                     f"but got size {flat_param.grad.size()}",
                 )
             flat_param.grad = None
+        else:
+            print(f"[Rank {self.rank}] did not save to _saved_grad_shard")
 
     def prepare_gradient_for_optim(self):
         """
@@ -1225,6 +1230,7 @@ class FlatParamHandle:
         # Delete `_saved_grad_shard` since its existence indicates a previous
         # gradient to accumulate with in the post-backward hook
         if hasattr(flat_param, "_saved_grad_shard"):
+            print(f"[Rank {self.rank}] delattr _saved_grad_shard ")
             delattr(flat_param, "_saved_grad_shard")
 
     @contextlib.contextmanager
@@ -1636,7 +1642,8 @@ class FlatParamHandle:
                 param_start, param_end = flat_param._shard_param_offsets[i - start]  # type: ignore[attr-defined]
                 numel_in_shard = param_end - param_start + 1
                 assert flat_param._is_grad_none is not None  # mypy
-                if not flat_param._is_grad_none[i]:
+                print(f"[Rank {self.rank}] {self.flat_param._fqns[i]} requires_grad: {param.requires_grad}")
+                if param.requires_grad and not flat_param._is_grad_none[i]:
                     if self._keep_low_precision_grads or param.dtype != grad.dtype:
                         # NOTE: This is a hack using `.data` to side step the
                         # check that parameter/gradient dtypes match. Here,
@@ -1945,6 +1952,8 @@ class FlatParamHandle:
             # In the post-backward hook, the sharded gradient is still in
             # `_saved_grad_shard`.
             grad = flat_param._saved_grad_shard  # type: ignore[attr-defined]
+        # elif self._use_orig_params and self._training_state == HandleTrainingState.BACKWARD_PRE:
+        #     grad = flat_param._local_shard
         else:
             # If in IDLE or in FORWARD states, then there may be an
             # (accumulated) gradient. If accessed in IDLE, then this should

@@ -30,6 +30,7 @@ from torch.distributed.fsdp._common_utils import (
     HandleTrainingState,
 )
 from torch.distributed.utils import _alloc_storage, _free_storage, _p_assert
+from torch.utils.hooks import RemovableHandle
 
 from ._fsdp_extensions import _ext_post_unflatten_transform, _ext_pre_flatten_transform
 from ._utils import _no_dispatch_record_stream, _same_storage_as_data_ptr
@@ -224,13 +225,6 @@ class FlatParameter(nn.Parameter):
         _shared_params (Optional[List[nn.Parameter]]): The original shared
             parameter variables if ``use_orig_params=True`` and ``None``
             otherwise.
-        _tensors (Optional[List[Optional[Tensor]]]): This saves the ``Tensor``
-            views created in the forward and tracked by autograd when
-            ``use_orig_params=True`` and is ``None`` otherwise. This is to
-            preserve those ``Tensor`` variables for the backward to ensure that
-            the ``FlatParameter`` 's ``AccumulateGrad`` object does not change
-            in which case the post-backward hook does not run. This is relevant
-            for cases like reentrant activation checkpointing.
         _is_grad_none (Optional[List[bool]]): A mask over the original
             parameters' gradients indicating if it is logically ``None`` or not
             if ``use_orig_params=True`` and ``None`` otherwise. This is needed
@@ -295,14 +289,10 @@ class FlatParameter(nn.Parameter):
             self._is_grad_none: Optional[List[bool]] = [
                 False for _ in range(len(params))
             ]
-            self._tensors: Optional[List[Optional[Tensor]]] = [
-                None for _ in range(len(self._params))
-            ]
         else:
             self._params = None
             self._shared_params = None
             self._is_grad_none = None
-            self._tensors = None
         self._unpadded_unsharded_size = self.size()
         _set_fsdp_flattened(self)
         # Tracks whether the `FlatParameter`'s post-backward hook has been
@@ -378,8 +368,14 @@ class FlatParamHandle:
         self._fully_sharded_module = fully_sharded_module
         self._init_flat_param(params, fully_sharded_module, use_orig_params)
         self._orig_param_dtype = self.flat_param.dtype
-        self._use_unsharded_views(as_params=False)
+        self._use_unsharded_views(as_params=self._use_orig_params)
         self._init_param_reduce_dtypes(mp_param_dtype, mp_reduce_dtype)
+
+        self._ran_grad_alloc_hook = False
+        self._grad_alloc_hook_handles: List[Optional[RemovableHandle]] = [
+            None for _ in range(self.flat_param._num_params)
+        ]
+        self._multi_post_grad_hook = None
 
     def _init_flat_param(
         self,
@@ -1019,15 +1015,8 @@ class FlatParamHandle:
             unsharded_size
         )  # this `.view()` is not autograd visible
         in_forward = self._training_state == HandleTrainingState.FORWARD
-        in_pre_backward = self._training_state == HandleTrainingState.BACKWARD_PRE
         if self._use_orig_params:
-            # We use `Tensor` views in the forward so that they are tracked by
-            # autograd. We use them in the pre-backward as well to support
-            # reentrant activation checkpointing, which needs the views to be
-            # tracked by autograd in the backward pass's recomputed forward.
-            self._use_unsharded_views(
-                as_params=(not in_forward and not in_pre_backward)
-            )
+            self._use_unsharded_views(as_params=True)
         elif in_forward:
             self._use_unsharded_views(as_params=False)
 
@@ -1101,6 +1090,12 @@ class FlatParamHandle:
             self._check_sharded(flat_param.grad)
             flat_param._saved_grad_shard = flat_param.grad  # type: ignore[attr-defined]
             sharded_grad = flat_param._saved_grad_shard  # type: ignore[attr-defined]
+            if sharded_grad.device != self.device:
+                _p_assert(
+                    sharded_grad.device == torch.device("cpu") and self._offload_params,
+                    f"`flat_param.grad` on unexpected device {sharded_grad.device}",
+                )
+                sharded_grad = sharded_grad.to(self.device)
         dist.all_gather_into_tensor(
             padded_unsharded_grad, sharded_grad, self.process_group
         )
@@ -1418,17 +1413,8 @@ class FlatParamHandle:
             else:  # `as_params=False`
                 param_var: Tensor = view
                 if self._use_orig_params:
-                    if self._training_state == HandleTrainingState.FORWARD:
-                        # Save the `Tensor` for the pre-backward
-                        self.flat_param._tensors[i] = view  # save for pre-backward
-                    elif self._training_state == HandleTrainingState.BACKWARD_PRE:
-                        # Use the saved `Tensor` variable from the forward to
-                        # preserve the autograd graph so that the post-backward
-                        # hook fires (e.g. for reentrant AC)
-                        tensor = self.flat_param._tensors[i]
-                        tensor.data = view
-                        param_var = tensor
-                self._setattr_tensor(module, param_name, param_var)
+                    raise AssertionError("This branch should be unreachable")
+                setattr(module, param_name, param_var)
                 if (
                     self._use_orig_params
                     and self._training_state == HandleTrainingState.FORWARD
@@ -1539,7 +1525,7 @@ class FlatParamHandle:
         try:
             yield
         finally:
-            self._use_unsharded_views(as_params=False)
+            self._use_unsharded_views(as_params=self._use_orig_params)
 
     @no_type_check
     @torch.no_grad()
@@ -1595,10 +1581,6 @@ class FlatParamHandle:
             self._setattr_param(module, param_name, param)
             prim_param = getattr(prim_module, prim_param_name)
             param.data = prim_param  # could be both empty and non-empty
-        if self._training_state == HandleTrainingState.BACKWARD_POST:
-            # Clear the saved `Tensor`s since they are unneeded now
-            for i in range(len(self.flat_param._tensors)):
-                self.flat_param._tensors[i] = None
 
     @torch.no_grad()
     def _use_sharded_grad_views(self) -> None:

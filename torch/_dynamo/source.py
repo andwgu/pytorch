@@ -372,6 +372,10 @@ class NotNNModuleSource(NNModuleSource):
         return _GUARD_SOURCE_NOT_NN_MODULE[self.inner.guard_source()]
 
 
+class FSDPNNModuleSource(NotNNModuleSource):
+    ...
+
+
 @dataclasses.dataclass
 class ConstantSource(Source):
     source_name: str

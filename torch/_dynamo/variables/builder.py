@@ -24,6 +24,7 @@ from ..side_effects import SideEffects
 from ..source import (
     AttrSource,
     ConstantSource,
+    FSDPNNModuleSource,
     GetItemSource,
     GlobalSource,
     GlobalWeakRefSource,
@@ -87,7 +88,7 @@ from .misc import (
     SkipFilesVariable,
     TypingVariable,
 )
-from .nn_module import UnspecializedNNModuleVariable
+from .nn_module import FSDPNNModuleVariable, UnspecializedNNModuleVariable
 from .tensor import (
     SymNodeVariable,
     TensorVariable,
@@ -525,6 +526,8 @@ class VariableBuilder:
                 guards=make_guards(GuardBuilder.FUNCTION_MATCH),
             )
         else:
+            if torch.distributed.get_rank() == 0:
+                print(f"userDefinedObjectVariable with TYPE_MATCH")
             result = UserDefinedObjectVariable(
                 value,
                 source=self.source,
@@ -661,7 +664,7 @@ class VariableBuilder:
 
             # See note [Dynamo treats FSDP wrapped modules as UnspecializedNNModule]
             # in fully_sharded_data_parallel.py for more information
-            return UnspecializedNNModuleVariable(
+            return FSDPNNModuleVariable(
                 value, guards=self.make_guards(GuardBuilder.TYPE_MATCH)
             )
         else:

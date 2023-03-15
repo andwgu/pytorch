@@ -12,7 +12,7 @@ from ..allowed_functions import is_allowed
 from ..exc import RestartAnalysis, unimplemented
 from ..guards import GuardBuilder
 from ..mutation_guard import GenerationTracker
-from ..source import AttrSource, GetItemSource, NNModuleSource, NotNNModuleSource
+from ..source import AttrSource, FSDPNNModuleSource, GetItemSource, NNModuleSource, NotNNModuleSource, Source
 from ..utils import (
     get_custom_getattr,
     is_lazy_module,
@@ -565,6 +565,9 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
             # force guard checks even when `not config.guard_nn_modules``
             self.source = NotNNModuleSource(self.source)
 
+    def _wrap_source(self, inner: Source) -> Source:
+        return inner
+
     @staticmethod
     @functools.lru_cache(None)
     def _nn_module_method_ids():
@@ -589,7 +592,7 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
         ):
             assert self.source
             return [
-                VariableBuilder(tx, source=GetItemSource(self.source, idx))(
+                VariableBuilder(tx, source=self._wrap_source(GetItemSource(self.source, idx)))(
                     item
                 ).add_options(self)
                 for idx, item in enumerate(self.value)
@@ -606,10 +609,10 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
         # until we can support a larger swath of python
         if is_lazy_module(self.value):
             fn = self.value_type.__call__
-            source = AttrSource(AttrSource(self.source, "__class__"), "__call__")
+            source = self._wrap_source(AttrSource(AttrSource(self.source, "__class__"), "__call__"))
         else:
             fn = self.value_type.forward
-            source = AttrSource(AttrSource(self.source, "__class__"), "forward")
+            source = self._wrap_source(AttrSource(AttrSource(self.source, "__class__"), "forward"))
 
         return variables.UserFunctionVariable(
             fn, source=source, **options
@@ -640,7 +643,7 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
                 items = []
                 for name, value in self.value.named_parameters():
                     items.append(
-                        VariableBuilder(tx, AttrSource(self.source, name))(
+                        VariableBuilder(tx, self._wrap_source(AttrSource(self.source, name)))(
                             value
                         ).add_options(options)
                     )
@@ -648,8 +651,10 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
                     items, mutable_local=MutableLocal(), **options
                 )
             elif isinstance(method, staticmethod):
-                source = AttrSource(
-                    AttrSource(AttrSource(self.source, "__class__"), name), "__func__"
+                source = self._wrap_source(
+                    AttrSource(
+                        AttrSource(AttrSource(self.source, "__class__"), name), "__func__"
+                    )
                 )
                 return tx.inline_user_function_return(
                     variables.UserFunctionVariable(
@@ -659,6 +664,16 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
                     kwargs,
                 )
             if id(method.__code__) in self._nn_module_method_ids():
-                unimplemented(f"UnspecializedNNModuleVariable missing {name}")
+                unimplemented(f"{self.__class__.__name__} missing {name}")
 
         return super().call_method(tx, name, args, kwargs)
+
+
+class FSDPNNModuleVariable(UnspecializedNNModuleVariable):
+    def __init__(self, value, **kwargs):
+        super().__init__(value, **kwargs)
+
+    def _wrap_source(self, inner: Source) -> Source:
+        if torch.distributed.get_rank() == 0:
+            print(f"Wrapping {inner} with FSDPNNModuleSource")
+        return FSDPNNModuleSource(inner)

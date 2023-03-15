@@ -219,6 +219,8 @@ class GuardBuilder(GuardBuilderBase):
         self._produce_guard_code(guard, [code], provided_guarded_object=self.get(base))
 
     def EQUALS_MATCH(self, guard: Guard):
+        if torch.distributed.get_rank() == 0:
+            print("EQUALS_MATCH")
         ref = self.arg_ref(guard)
         val = self.get(guard.name)
         t = type(val)
@@ -339,6 +341,8 @@ class GuardBuilder(GuardBuilderBase):
         self._produce_guard_code(guard, code)
 
     def TUPLE_ITERATOR_LEN(self, guard):
+        if torch.distributed.get_rank() == 0:
+            print("TUPLE_ITERATOR_LEN")
         ref = self.arg_ref(guard)
         value = self.get(guard.name)
         t = type(value)
@@ -353,9 +357,12 @@ class GuardBuilder(GuardBuilderBase):
         ref = self.arg_ref(guard)
         value = self.get(guard.name)
         t = type(value)
+        
 
         code = list()
         code.append(f"___check_type_id({ref}, {self.id_ref(t)})")
+        if torch.distributed.get_rank() == 0:
+            print("DICT_KEYS:", f"___check_type_id({ref}, {self.id_ref(t)})")
         param_key_ids = set(dict_param_key_ids(value))
         const_keys = set(dict_const_keys(value))
         const_keys_repr = dict_const_keys_repr(const_keys)
@@ -376,6 +383,8 @@ class GuardBuilder(GuardBuilderBase):
         t = type(value)
         keys = {k for k, v in value.named_parameters()}
 
+        if torch.distributed.get_rank() == 0:
+            print("NN_MODULE_PARAM_NAMES")
         code = list()
         code.append(f"___check_type_id({ref}, {self.id_ref(t)})")
         code.append(f"{{k for k, v in {ref}.named_parameters()}} == {keys!r}")
@@ -388,6 +397,8 @@ class GuardBuilder(GuardBuilderBase):
         value = self.get(guard.name)
         t = type(value)
 
+        if torch.distributed.get_rank() == 0:
+            print("ODICT_KEYS")
         code = list()
         code.append(f"___check_type_id({ref}, {self.id_ref(t)})")
         code.append(f"str({ref}.keys()) == {str(value.keys())!r}")
@@ -637,6 +648,8 @@ class CheckFunctionManager:
                 and "hooks" not in guard.name
             ):
                 continue
+            # if torch.distributed.get_rank() == 0:
+            #     print("guard:", guard)
             guard.create(local_builder, global_builder)
         self.check_fn = self.compile_check_fn(
             local_builder, global_builder, guards, guard_fail_fn

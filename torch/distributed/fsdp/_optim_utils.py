@@ -264,7 +264,13 @@ def _unflatten_communicated_optim_state(
         for state_name, flat_tensor in sorted_items(tensor_state):
             views_generated = state_name in flat_param_views
             if not views_generated:
-                views = FlatParamHandle._get_unflat_views(flat_param, flat_tensor)
+                # TODO: We need to skip padding here. Make sure that
+                # `_num_params` has consistent semantics (i.e. whether it
+                # includes padding or not).
+                assert not fsdp_state._align_addresses, "Not yet implemented"
+                views = FlatParamHandle._get_unflat_views(
+                    flat_param, flat_tensor, fsdp_state._align_addresses
+                )
                 flat_param_views[state_name] = views
             else:
                 views = flat_param_views[state_name]

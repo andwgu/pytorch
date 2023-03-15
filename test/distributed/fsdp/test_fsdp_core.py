@@ -170,6 +170,26 @@ class TestParityWithDDP(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     @parametrize(params, configs, subtest_name)
+    def test_transformer_aligned(
+        self,
+        cpu_offload: CPUOffload,
+        sharding_strategy: Optional[ShardingStrategy],
+    ):
+        config = self._get_subtest_config(cpu_offload)
+        config.pop("use_orig_params", None)
+        self.run_subtests(
+            config,
+            self._test_fsdp_parity,
+            TransformerWithSharedParams,
+            FSDPInitMode.RECURSIVE,
+            cpu_offload=cpu_offload,
+            sharding_strategy=sharding_strategy,
+            use_orig_params=True,
+            align_addresses=True,
+        )
+
+    @skip_if_lt_x_gpu(2)
+    @parametrize(params, configs, subtest_name)
     def test_delayed_optim_step(
         self,
         cpu_offload: CPUOffload,

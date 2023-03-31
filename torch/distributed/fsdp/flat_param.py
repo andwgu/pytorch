@@ -41,6 +41,7 @@ __all__ = [
     "FlatParamHandle",
     "FlatParamShardMetadata",
     "ParamInfo",
+    "ParamState",
     "SharedParamInfo",
     "HandleShardingStrategy",
 ]
@@ -153,6 +154,25 @@ class HandleShardingStrategy(Enum):
     NO_SHARD = auto()
     HYBRID_SHARD = auto()
     _HYBRID_SHARD_ZERO2 = auto()
+
+
+class ParamState(Enum):
+    """
+    NOTE: ``NO_SHARD`` never uses ``SHARDED``.
+    """
+
+    SHARDED = auto()
+    UNSHARDED_AS_PARAMS = auto()
+    UNSHARDED_AS_TENSORS = auto()
+
+
+class GradState(Enum):
+    """
+    NOTE: ``NO_SHARD`` never uses ``SHARDED``.
+    """
+
+    SHARDED = auto()
+    UNSHARDED = auto()
 
 
 class FlatParameter(nn.Parameter):
@@ -417,6 +437,8 @@ class FlatParamHandle:
         self._training_state = HandleTrainingState.IDLE
         self._debug_level = dist.get_debug_level()
         self._fully_sharded_module = fully_sharded_module
+        self._param_state = ParamState.UNSHARDED_AS_TENSORS
+        self._grad_state = GradState.UNSHARDED
         # Optimistically assume a valid input `params` and set dtype attributes
         # before `_init_flat_param()`, which performs the actual validation
         self._orig_param_dtype = params[0].dtype
@@ -714,7 +736,7 @@ class FlatParamHandle:
             self._init_shard_metadata(numel_padded, start_idx, end_idx)
             if orig_storage._size() > 0:
                 orig_storage._resize_(0)
-        if self._use_orig_params:
+        if self._use_orig_params or self.uses_sharded_strategy:
             self._use_sharded_views()
 
     def _init_shard_metadata(
@@ -1008,6 +1030,8 @@ class FlatParamHandle:
                 dtype=unsharded_param_dtype,
             )
             flat_param._padded_unsharded_size = flat_param._full_param_padded.size()
+            if self.rank == 0:
+                print(f"_padded_unsharded_size={flat_param._padded_unsharded_size} for {self}")
             _free_storage(flat_param._full_param_padded)
 
             if self._uses_param_mixed_precision:
@@ -1025,22 +1049,24 @@ class FlatParamHandle:
     ###################
     def pre_unshard(self) -> bool:
         """
-        Returns: ``False`` if this is a no-op and ``True`` otherwise.
+        Returns: ``False`` if this is a no-op and ``True`` otherwise. Note that
+        ``False`` only means that no pre-unshard transformation is needed, not
+        that the unshard itself is not needed.
 
         Postcondition: ``self.flat_param`` 's data is on the device for
         communication and is what should be all-gathered. This means that it
         matches the dtype of the expected unsharded parameter.
         """
+        force_pre_unshard = (
+            (not self.uses_sharded_strategy and self._offload_params)
+            or self._force_full_precision
+        )
+        if not self.needs_unshard and not force_pre_unshard:
+            return False
         ret = False
         if self._use_orig_params:
             ret = self._writeback_orig_params()
-        if (
-            self.uses_sharded_strategy
-            and not self._offload_params
-            and not self.needs_unshard()
-        ):
-            pass  # no-op
-        elif self._uses_param_mixed_precision and not self._force_full_precision:
+        if self._uses_param_mixed_precision and not self._force_full_precision:
             self._use_low_precision_shard()
             ret = True
         elif self._offload_params and self.flat_param.device != self.device:
@@ -1069,7 +1095,7 @@ class FlatParamHandle:
         # Invariant: `_mp_shard` is always on the compute device.
         flat_param.data = flat_param._mp_shard  # type: ignore[attr-defined]
 
-    def unshard(self):
+    def unshard(self, as_params: bool):
         """
         Runs the unshard logic. This includes all-gathering the flat parameter
         and switching to using the unsharded flat parameter. If the handle does
@@ -1079,30 +1105,29 @@ class FlatParamHandle:
         If FSDP is in :meth:`summon_full_params` and the handle uses parameter
         mixed precision, then the parameter is forced to full precision.
         """
-        if not self.needs_unshard():
-            # Even when not needing an unshard, we should switch to using
-            # the unsharded flat parameter
+        # as_params = self._as_params
+        if (
+            (as_params and not self.needs_unshard_as_params)
+            or (not as_params and not self.needs_unshard_as_tensors)
+        ):
+            if self.rank == 0:
+                print(f"unshard return early because as_params={as_params} and {self._param_state} for {self}")
+            return
+        if self.needs_unshard or self._force_full_precision:
+            unsharded_flat_param = self._alloc_padded_unsharded_flat_param()
+            if self.rank == 0:
+                print(f"unsharded_flat_param: {unsharded_flat_param.numel()}")
+            unsharded_flat_param = self._all_gather_flat_param(unsharded_flat_param)
+        else:
+            if self.rank == 0:
+                print(f"{self} does not need unshard since {self._param_state}")
+            # `UNSHARDED_AS_PARAMS` <-> `UNSHARDED_AS_TENSORS`
             unsharded_flat_param = (
                 self._get_padded_unsharded_flat_param()
                 if self.uses_sharded_strategy
                 else self.flat_param
             )
-            self._use_unsharded_flat_param(unsharded_flat_param)
-            return
-        unsharded_flat_param = self._alloc_padded_unsharded_flat_param()
-        padded_unsharded_flat_param = self._all_gather_flat_param(unsharded_flat_param)
-        self._use_unsharded_flat_param(padded_unsharded_flat_param)
-
-    def needs_unshard(self) -> bool:
-        """Returns if the handle's flat parameter needs to be unsharded."""
-        if not self.uses_sharded_strategy:
-            return False
-        unsharded_flat_param = self._get_padded_unsharded_flat_param()
-        already_unsharded = (
-            unsharded_flat_param._typed_storage()._size()
-            == unsharded_flat_param.numel()
-        )
-        return not already_unsharded
+        self._use_unsharded_flat_param(unsharded_flat_param, as_params)
 
     def _alloc_padded_unsharded_flat_param(self):
         """
@@ -1116,6 +1141,8 @@ class FlatParamHandle:
         unsharded_flat_param = self._get_padded_unsharded_flat_param()
         self._check_storage_freed(unsharded_flat_param)
         _alloc_storage(unsharded_flat_param, flat_param._padded_unsharded_size)  # type: ignore[attr-defined]
+        if self.rank == 0:
+            print(f"alloc flat param in {self._training_state} {self._param_state} {self} {flat_param._padded_unsharded_size} {unsharded_flat_param.numel()}")
         return unsharded_flat_param
 
     def _get_padded_unsharded_flat_param(self) -> torch.Tensor:
@@ -1152,8 +1179,9 @@ class FlatParamHandle:
             hasattr(self, "process_group") and hasattr(self, "world_size"),
             "Expects a process group and world size to have been set via `shard()`",
         )
-        sharded_flat_param = self.flat_param.data
-        expected_numel = sharded_flat_param.numel() * self.world_size
+        sharded_flat_param = self.flat_param.data if self.flat_param.size() == self.flat_param._sharded_size else self.flat_param._local_shard
+        # sharded_flat_param = self.flat_param._local_shard
+        expected_numel = self.flat_param._padded_unsharded_size.numel()
         _p_assert(
             padded_unsharded_flat_param.numel() == expected_numel,
             f"Expects {expected_numel} numel but got {padded_unsharded_flat_param.numel()}",
@@ -1168,6 +1196,7 @@ class FlatParamHandle:
     def _use_unsharded_flat_param(
         self,
         padded_unsharded_flat_param: torch.Tensor,
+        as_params: bool,
     ) -> None:
         """
         Switches to using the *unpadded* unsharded flat parameter, which is a
@@ -1179,18 +1208,17 @@ class FlatParamHandle:
         ].view(
             unsharded_size
         )  # this `.view()` is not autograd visible
-        in_forward = self._training_state == HandleTrainingState.FORWARD
-        in_pre_backward = self._training_state == HandleTrainingState.BACKWARD_PRE
-        if self._use_orig_params:
-            # We use `Tensor` views in the forward so that they are tracked by
-            # autograd. We use them in the pre-backward as well to support
-            # reentrant activation checkpointing, which needs the views to be
-            # tracked by autograd in the backward pass's recomputed forward.
-            self._use_unsharded_views(
-                as_params=(not in_forward and not in_pre_backward)
-            )
-        elif in_forward:
-            self._use_unsharded_views(as_params=False)
+        if (
+            not self._use_orig_params
+            and not as_params
+            and self._training_state != HandleTrainingState.FORWARD
+        ):
+            # NOTE: As a special case for `use_orig_params=False`, the `Tensor`
+            # views preserve between forward and backward, so we only need to
+            # use unsharded views in forward.
+            self._param_state = ParamState.UNSHARDED_AS_TENSORS
+            return
+        self._use_unsharded_views(as_params)
 
     def post_unshard(self):
         """
@@ -1198,7 +1226,10 @@ class FlatParamHandle:
         shard if needed.
         """
         if self._uses_param_mixed_precision and self.uses_sharded_strategy:
+            # TODO: This is a no-op if already freed.
             self._free_low_precision_sharded_param()
+        # if not self.uses_sharded_strategy and self._offload_params:
+        #     return
         self._check_on_compute_device(self.flat_param)
 
     def _free_low_precision_sharded_param(self):
@@ -1272,7 +1303,8 @@ class FlatParamHandle:
         self._use_unsharded_grad_views()
 
     def reshard_grad(self):
-        if self._use_orig_params:
+        # TODO:
+        if self._use_orig_params and self._param_state == ParamState.SHARDED:
             self._use_sharded_grad_views()
         if not self.uses_sharded_strategy:
             return
@@ -1402,17 +1434,19 @@ class FlatParamHandle:
         strategy.
         Postcondition: Same as the precondition.
         """
+        # TODO: `UNSHARDED_AS_PARAMS` <-> `UNSHARDED_AS_PARAMS`
         self._check_sharded_strategy()
+        flat_param = self.flat_param
         _p_assert(
-            self.flat_param.size() == self.flat_param._unpadded_unsharded_size,
-            f"Expects size {self.flat_param._unpadded_unsharded_size} but got {self.flat_param.size()}",
+            flat_param.size() == flat_param._unpadded_unsharded_size,
+            f"Expects size {flat_param._unpadded_unsharded_size} but got {flat_param.size()}",
         )
-        self._check_on_compute_device(self.flat_param)
+        self._check_on_compute_device(flat_param)
         # Check that the unpadded unsharded flat parameter is a view into the
         # padded unsharded flat parameter as expected
         # NOTE: This check is not strictly needed for correctness but is a
         # useful sanity check since the tensor should only be used internally.
-        unpadded_storage_ptr = self.flat_param._typed_storage()._data_ptr()
+        unpadded_storage_ptr = flat_param._typed_storage()._data_ptr()
         padded_storage_ptr = (
             self._get_padded_unsharded_flat_param()._typed_storage()._data_ptr()
         )
@@ -1426,29 +1460,25 @@ class FlatParamHandle:
             yield
         finally:
             _p_assert(
-                self.flat_param.size() == self.flat_param._unpadded_unsharded_size,
-                f"Expects size {self.flat_param._unpadded_unsharded_size} but got {self.flat_param.size()}",
+                flat_param.size() == flat_param._unpadded_unsharded_size,
+                f"Expects size {flat_param._unpadded_unsharded_size} but got {flat_param.size()}",
             )
             padded_unsharded_flat_param = self._alloc_padded_unsharded_flat_param()
             # Copy from CPU to the compute device
-            padded_unsharded_flat_param[: self.flat_param.numel()].copy_(
-                self.flat_param
+            padded_unsharded_flat_param[: flat_param.numel()].copy_(
+                flat_param
             )
-            self._use_unsharded_flat_param(padded_unsharded_flat_param)
+            # TODO: Hard code `as_params=True` since this method is currently
+            # only used for that case.
+            self._use_unsharded_flat_param(padded_unsharded_flat_param, True)
 
-    def reshard(self, free_unsharded_flat_param: bool):
-        """
-        Runs the reshard logic. This includes freeing the unsharded flat
-        parameter if ``free_unsharded_flat_param`` and switching to using the
-        sharded flat parameter.
-        """
+    def reshard(self):
         # Switch to the sharded `FlatParameter` before freeing to prevent
-        # "use-after-free"-type bugs with external profiling tools, where for
+        # "use-after-free" type bugs with external profiling tools, where for
         # `use_orig_params=True`, the `param` does not point to valid memory
-        # when setting `param.data = ...` in `_use_sharded_views()`.
+        # when setting `param.data = ...` in `_use_sharded_views()`
         self._use_sharded_flat_param()
-        if free_unsharded_flat_param:
-            self._free_unsharded_flat_param()
+        self._free_unsharded_flat_param()
 
     def post_reshard(self):
         """
@@ -1481,6 +1511,8 @@ class FlatParamHandle:
         self._check_on_compute_device(unsharded_flat_param)
         # Do not free the memory until all ops in the current stream finish
         _no_dispatch_record_stream(unsharded_flat_param, torch.cuda.current_stream())
+        if self.rank == 0:
+            print(f"free flat param in {self._training_state} {self._param_state} {self}")
         _free_storage(unsharded_flat_param)
 
     def _use_sharded_flat_param(self) -> None:
@@ -1493,8 +1525,15 @@ class FlatParamHandle:
                 f"Expects the local shard to be on CPU but got {device}",
             )
         flat_param.data = flat_param._local_shard  # type: ignore[attr-defined]
+        if not self._use_orig_params and self._training_state == HandleTrainingState.FORWARD:
+            # TODO: preserve views.
+            if self.rank == 0:
+                print(f"Skipping _use_sharded_views to preserve views for {self}")
+            self._param_state = ParamState.SHARDED
+            return
+        self._use_sharded_views()
+        # TODO:
         if self._use_orig_params:
-            self._use_sharded_views()
             # For the post-forward reshard, we may try to use sharded gradient
             # views (or unsharded gradient views if a gradient was accumulated
             # in `no_sync()`), but for the post-backward reshard, we delay the
@@ -1586,6 +1625,11 @@ class FlatParamHandle:
         """
         flat_param = self.flat_param
         self._check_unsharded(flat_param)
+        self._param_state = (
+            ParamState.UNSHARDED_AS_PARAMS if as_params else ParamState.UNSHARDED_AS_TENSORS
+        )
+        if self.rank == 0:
+            print(f"_use_unsharded_views() -> {self._param_state} for {self} in {self._training_state}")
         views = self._get_unflat_views()
         for i, (view, (param_name, module, _)) in enumerate(
             zip(views, flat_param._param_infos)
@@ -1662,6 +1706,7 @@ class FlatParamHandle:
                 param.grad = None
             return
         self._check_unsharded(self.flat_param.grad)
+        self._grad_state = GradState.UNSHARDED
         views = self._get_unflat_views(self.flat_param.grad)
         for i, (view, (param_name, module, _)) in enumerate(
             zip(views, self.flat_param._param_infos)
@@ -1740,11 +1785,17 @@ class FlatParamHandle:
         """
         if not self.uses_sharded_strategy:
             # For `NO_SHARD`, use the *unflattened* unsharded views since we
-            # have the unsharded parameter
+            # have the unsharded flat parameter and pass `as_params=True` since
+            # this must be outside forward/backward computation.
             self._use_unsharded_views(as_params=True)
             return
         flat_param = self.flat_param
         self._check_sharded(flat_param)
+        if self.rank == 0:
+            print(f"_use_sharded_views() -> SHARDED for {self} in {self._training_state}")
+        self._param_state = ParamState.SHARDED
+        if not self._use_orig_params:
+            return
         # Construct once and reuse for all parameters not in the local shard
         size_0_empty_tensor = torch.empty(
             0,
@@ -1800,6 +1851,7 @@ class FlatParamHandle:
                 param.grad = None
             return
         self._check_sharded(grad)
+        self._grad_state = GradState.SHARDED
         for param, shard_param_info, is_grad_none in zip(
             flat_param._params,
             flat_param._shard_param_infos,
@@ -2038,7 +2090,7 @@ class FlatParamHandle:
     def flat_param_to(self, *args, **kwargs):
         """Wraps an in-place call to ``.to()`` for ``self.flat_param``."""
         self.flat_param.data = self.flat_param.to(*args, **kwargs)
-        if self._use_orig_params:
+        if self._use_orig_params or self.uses_sharded_strategy:
             # Refresh the views because their storage may have changed
             if self.is_sharded(self.flat_param):
                 self._use_sharded_views()
@@ -2246,6 +2298,35 @@ class FlatParamHandle:
             self._training_state == HandleTrainingState.SUMMON_FULL_PARAMS
             and self._uses_param_mixed_precision
         )
+
+    # NOTE: We must have these "needs..." properties to be fast to compute.
+    @property
+    def needs_unshard_as_tensors(self) -> bool:
+        return self._param_state != ParamState.UNSHARDED_AS_TENSORS
+
+    @property
+    def needs_unshard_as_params(self) -> bool:
+        return self._param_state != ParamState.UNSHARDED_AS_PARAMS
+    
+    @property
+    def needs_unshard(self) -> bool:
+        return self._param_state == ParamState.SHARDED
+    
+    @property
+    def needs_reshard(self):
+        if self.uses_sharded_strategy:
+            return self._param_state != ParamState.SHARDED
+        else:
+            # NOTE: `NO_SHARD` never uses `SHARDED`.
+            return self._param_state == ParamState.UNSHARDED_AS_PARAMS
+
+    # @property
+    # def _as_params(self):
+    #     # For forward/backward computation, use `Tensor` views; otherwise, use
+    #     # parameter views
+    #     in_forward = self._training_state == HandleTrainingState.FORWARD
+    #     in_pre_backward = self._training_state == HandleTrainingState.BACKWARD_PRE
+    #     return not in_forward and not in_pre_backward
 
 
 # NOTE: These are hacks to bypass `nn.Module.__setattr__` checks.

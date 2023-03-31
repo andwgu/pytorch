@@ -300,6 +300,7 @@ def _unshard(
     handles: List[FlatParamHandle],
     unshard_stream: torch.cuda.Stream,
     pre_unshard_stream: torch.cuda.Stream,
+    as_params: bool,
 ) -> None:
     """
     Unshards the handles in ``handles``. If the handles are in
@@ -324,7 +325,7 @@ def _unshard(
             event.synchronize()
     with torch.cuda.stream(unshard_stream):
         for handle in handles:
-            handle.unshard()
+            handle.unshard(as_params)
             handle.post_unshard()
 
 
@@ -332,22 +333,32 @@ def _unshard(
 def _reshard(
     state: _FSDPState,
     handles: List[FlatParamHandle],
-    free_unsharded_flat_params: List[bool],
 ):
     """
+    TODO
     Reshards the handles in ``handles``. ``free_unsharded_flat_params`` should
     have the same length as ``handles``, and each element should give whether
     the corresponding handle should free its padded unsharded flat parameter.
     """
     if not handles:
         return
-    _p_assert(
-        len(handles) == len(free_unsharded_flat_params),
-        "Expects both lists to have equal length but got "
-        f"{len(handles)} and {len(free_unsharded_flat_params)}",
-    )
+    if state.rank == 0:
+        print(f"Reshard {handles} {[h._training_state for h in handles]}")
+    for handle in handles:
+        handle.reshard()
+        if state.limit_all_gathers:
+            free_event = torch.cuda.Event()
+            free_event.record()
+            state._free_event_queue.enqueue(free_event)
+        handle.post_reshard()
+    return  # TODO: clean up below.
+    # _p_assert(
+    #     len(handles_to_reshard) == len(free_unsharded_flat_params),
+    #     "Expects both lists to have equal length but got "
+    #     f"{len(handles_to_reshard)} and {len(free_unsharded_flat_params)}",
+    # )
     for handle, free_unsharded_flat_param in zip(
-        handles,
+        handles_to_reshard,
         free_unsharded_flat_params,
     ):
         handle.reshard(free_unsharded_flat_param)
@@ -356,6 +367,7 @@ def _reshard(
             free_event.record()
             state._free_event_queue.enqueue(free_event)
         handle.post_reshard()
+    # TODO: Deprecate `_handles_prefetched`.
     # Since we prefetch entire handles keys at a time, conservatively mark
     # the entire key as no longer prefetched once we free at least one
     handles_key = tuple(handles)
@@ -428,7 +440,7 @@ def _pre_forward_unshard(
     """Unshards parameters in the pre-forward."""
     if not handles:
         return
-    _unshard(state, handles, state._streams["unshard"], state._streams["pre_unshard"])
+    _unshard(state, handles, state._streams["unshard"], state._streams["pre_unshard"], False)
     handles_key = tuple(handles)
     state._needs_pre_forward_unshard[handles_key] = False
     torch.cuda.current_stream().wait_stream(state._streams["unshard"])
@@ -485,6 +497,19 @@ def _post_forward_reshard(
     """Reshards parameters in the post-forward."""
     if not handles:
         return
+    # Do not free the root's parameters in the post-forward for `FULL_SHARD`
+    # with the intention that they are immediately used for backward
+    # computation (though this may not be true)
+    handles_to_reshard = [
+        handle
+        for handle in handles
+        if (
+            not state._is_root
+            and handle._sharding_strategy in RESHARD_AFTER_FORWARD_STRATEGIES
+        )
+    ]
+    _reshard(state, handles_to_reshard)
+    return  # TODO: clean up below
     # Do not free the root's parameters in the post-forward for `FULL_SHARD`
     # with the intention that they are immediately used for backward
     # computation (though this may not be true)
@@ -628,13 +653,20 @@ def _pre_backward_hook(
             # If the handles have been prefetched, then there is no need to
             # call `_unshard()` again
             if not state._handles_prefetched.get(_handles_key, False):
+                if state.rank == 0:
+                    print(f"pre-backward unshard for {_handles}")
                 _unshard(
                     state,
                     _handles,
                     state._streams["unshard"],
                     state._streams["pre_unshard"],
+                    False,
                 )
+            elif state.rank == 0:
+                print(f"pre-backward no unshard for {_handles} since already prefetched")
             torch.cuda.current_stream().wait_stream(state._streams["unshard"])
+        elif state.rank == 0:
+            print(f"pre-backward hook {_handles} does not need unshard")
 
         # Set this to `False` to ensure that a mistargeted prefetch does not
         # actually unshard these handles
@@ -686,8 +718,14 @@ def _post_backward_hook(
         if flat_param.grad.requires_grad:
             raise RuntimeError("FSDP does not support gradients of gradients")
 
-        free_unsharded_flat_param = _should_free_in_backward(state, handle)
-        _reshard(state, [handle], [free_unsharded_flat_param])
+        if state.rank == 0:
+            print(f"should reshard: {_should_reshard_in_backward(state, handle)} needs reshard: {handle.needs_reshard} {handle._param_state} {handle}")
+        if _should_reshard_in_backward(state, handle) and handle.needs_reshard:
+            _reshard(state, [handle])
+        elif state.rank == 0:
+            print(f"[Rank 0] not resharding {handle} in post-backward")
+        # free_unsharded_flat_param = _should_free_in_backward(state, handle)
+        # _reshard(state, [handle], [free_unsharded_flat_param])
 
         # TODO: Post-backward prefetching does not support the multiple handles
         # per module case since the post-backward hook runs per handle, not per
@@ -700,8 +738,8 @@ def _post_backward_hook(
                 handle._use_unsharded_grad_views()
             return
 
-        # Wait for all ops in the current stream (e.g. gradient
-        # computation) to finish before reduce-scattering the gradient
+        # Wait for all ops in the current stream (e.g. gradient computation to
+        # finish before reduce-scattering the gradient
         state._streams["post_backward"].wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(state._streams["post_backward"]):
@@ -804,23 +842,35 @@ def _post_backward_hook(
 
 
 @no_type_check
-def _should_free_in_backward(
+def _should_reshard_in_backward(
     state: _FSDPState,
     handle: FlatParamHandle,
 ) -> bool:
     """
-    Returns whether FSDP should free the unsharded flat parameter in the
-    post-backward or not.
+    Returns whether FSDP should reshard the flat parameter in the post-backward
+    or not.
     """
-    if not handle.uses_sharded_strategy:
-        return False
-    # If not syncing gradients, then we do not free for strategies that do not
-    # reshard after forward as a *heuristic* to tradeoff higher memory for
-    # higher throughput.
-    return (
-        state._sync_gradients
-        or handle._sharding_strategy in RESHARD_AFTER_FORWARD_STRATEGIES
-    )
+    return state._sync_gradients or handle._sharding_strategy in RESHARD_AFTER_FORWARD_STRATEGIES
+
+
+# @no_type_check
+# def _should_free_in_backward(
+#     state: _FSDPState,
+#     handle: FlatParamHandle,
+# ) -> bool:
+#     """
+#     Returns whether FSDP should free the unsharded flat parameter in the
+#     post-backward or not.
+#     """
+#     if not handle.uses_sharded_strategy:
+#         return False
+#     # If not syncing gradients, then we do not free for strategies that do not
+#     # reshard after forward as a *heuristic* to tradeoff higher memory for
+#     # higher throughput.
+#     return (
+#         state._sync_gradients
+#         or handle._sharding_strategy in RESHARD_AFTER_FORWARD_STRATEGIES
+#     )
 
 
 @no_type_check
@@ -937,21 +987,23 @@ def _catch_all_reshard(
     # Wrap with a try-except to provide a more informative traceback if an
     # error is raised
     try:
-        free_unsharded_flat_params: List[bool] = []
+        # free_unsharded_flat_params: List[bool] = []
         handles_to_reshard: List[FlatParamHandle] = []
         for handle in state._handles:
-            # TODO: This already-resharded check is brittle:
-            # https://github.com/pytorch/pytorch/issues/83956
-            already_resharded = (
-                handle.flat_param.data_ptr()
-                == handle.flat_param._local_shard.data_ptr()
-            )
-            if already_resharded:
-                continue
-            free_unsharded_flat_params.append(_should_free_in_backward(state, handle))
-            handles_to_reshard.append(handle)
+            if handle.needs_reshard and _should_reshard_in_backward(state, handle):
+                handles_to_reshard.append(handle)
+            # # TODO: This already-resharded check is brittle:
+            # # https://github.com/pytorch/pytorch/issues/83956
+            # already_resharded = (
+            #     handle.flat_param.data_ptr()
+            #     == handle.flat_param._local_shard.data_ptr()
+            # )
+            # if already_resharded:
+            #     continue
+            # free_unsharded_flat_params.append(_should_free_in_backward(state, handle))
+            # handles_to_reshard.append(handle)
         if handles_to_reshard:
-            _reshard(state, handles_to_reshard, free_unsharded_flat_params)
+            _reshard(state, handles_to_reshard)
     except Exception as e:
         _p_assert(
             False,
@@ -1005,8 +1057,10 @@ def _prefetch_handles(
     for handles_key in handles_to_prefetch:
         # Prefetch the next set of handles without synchronizing to allow
         # the sync to happen as late as possible to maximize overlap
+        if state.rank == 0:
+            print(f"prefetched {handles_key} curr: {list(h._training_state for h in current_handles_key)}")
         _unshard(
-            state, handles_key, state._streams["unshard"], state._streams["pre_unshard"]
+            state, handles_key, state._streams["unshard"], state._streams["pre_unshard"], False
         )
         state._handles_prefetched[handles_key] = True
 

@@ -22,7 +22,7 @@ from torch.distributed.fsdp._runtime_utils import (
     _unshard_grads,
 )
 from torch.distributed.utils import _p_assert
-from .flat_param import FlatParamHandle
+from .flat_param import FlatParamHandle, ParamState
 
 FLAT_PARAM = "_flat_param"
 
@@ -120,6 +120,15 @@ def _unflatten_as_params(state: _FSDPState, module: nn.Module) -> Generator:
                 _register_flat_param(state, module)
 
 
+@contextlib.contextmanager
+def _deregister_flat_param_ctx(state: _FSDPState, module: nn.Module) -> Generator:
+    _deregister_flat_param(state, module)
+    try:
+        yield
+    finally:
+        _register_flat_param(state, module)
+
+
 def _validate_unshard_params_args(
     state: _FSDPState,
     writeback: bool,
@@ -153,6 +162,24 @@ def _validate_unshard_params_args(
             "GPUs sharing the same CPU memory, which risks CPU OOM. We "
             "recommend using offload_to_cpu=True with rank0_only=True."
         )
+
+
+def _restore_handle_to_param_state(
+    state: _FSDPState,
+    handle: FlatParamHandle,
+    param_state: ParamState,
+    computation_stream: torch.cuda.Stream,
+):
+    if handle._param_state == param_state:
+        return
+    if param_state == ParamState.SHARDED:
+        _reshard(state, [handle])
+    elif param_state == ParamState.UNSHARDED_AS_TENSORS:
+        _unshard(state, [handle], computation_stream, computation_stream, False)
+    elif param_state == ParamState.UNSHARDED_AS_PARAMS:
+        _unshard(state, [handle], computation_stream, computation_stream, True)
+    else:
+        raise AssertionError(f"Unknown FlatParamHandle parameter state: {param_state}")
 
 
 @contextlib.contextmanager
@@ -191,17 +218,28 @@ def _unshard_fsdp_state_params(
         handle._training_state = HandleTrainingState.SUMMON_FULL_PARAMS
 
     _clear_grads_if_needed(handles)
-    free_unsharded_flat_params = [handle.needs_unshard() for handle in handles]
+
+    # Upon exit, restore the parameter state from entry
+    orig_param_states: List[ParamState] = []
+    for handle in handles:
+        if handle._param_state == ParamState.UNSHARDED_AS_PARAMS and handle.uses_sharded_strategy:
+            raise AssertionError(
+                "FlatParamHandle should not already be unsharded as parameters"
+            )
+        orig_param_states.append(handle._param_state)
     # No need to call `wait_stream()` since we unshard in the computation
     # stream directly
     computation_stream = torch.cuda.current_stream()
-    _unshard(state, handles, computation_stream, computation_stream)
+    _unshard(state, handles, computation_stream, computation_stream, True)
+
+    # TODO:
     if with_grads:
         _unshard_grads(handles)
 
     if rank0_only and state.rank != 0:
-        # Free the unsharded flattened parameter early
-        _reshard(state, handles, free_unsharded_flat_params)
+        for handle, orig_param_state in zip(handles, orig_param_states):
+            _restore_handle_to_param_state(state, handle, orig_param_state, computation_stream)
+        # TODO:
         if with_grads:
             _reshard_grads(handles)
         try:
@@ -221,14 +259,16 @@ def _unshard_fsdp_state_params(
                     # move gradients to CPU *after* we move parameters.
             # NOTE: This assumes 1 `FlatParameter`
             if not state._use_orig_params:
-                stack.enter_context(_unflatten_as_params(state, module))
+                stack.enter_context(_deregister_flat_param_ctx(state, module))
+                # stack.enter_context(_unflatten_as_params(state, module))
             try:
                 yield
             finally:
                 stack.close()
                 if writeback:
                     _writeback_to_local_shard(handles, with_grads)
-                _reshard(state, handles, free_unsharded_flat_params)
+                for handle, orig_param_state in zip(handles, orig_param_states):
+                    _restore_handle_to_param_state(state, handle, orig_param_state, computation_stream)
                 if with_grads:
                     _reshard_grads(handles)
                 for handle in handles:

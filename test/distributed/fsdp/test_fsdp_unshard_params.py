@@ -277,6 +277,14 @@ class TestUnshardParams(TestUnshardParamsBase):
         use_orig_params: bool,
     ):
         """NOTE: This method depends on FSDP internals."""
+        if self.rank == 0:
+            print(
+                f"_test_unshard_params_respects_reshard():\n"
+                f"rank0_only={rank0_only}\n"
+                f"offload_to_cpu={offload_to_cpu}\n"
+                f"mixed_precision={mixed_precision}\n"
+                f"use_orig_params={use_orig_params}\n"
+            )
         fsdp_kwargs = {
             "mixed_precision": mixed_precision,
             "use_orig_params": use_orig_params,
@@ -288,6 +296,8 @@ class TestUnshardParams(TestUnshardParamsBase):
             ),
             **fsdp_kwargs,
         )
+        if self.rank == 0:
+            print(f"root handle: {model._handles[0]}")
         outer_flat_param = model._handles[0].flat_param
         inner_flat_param = model.module[0]._handles[0].flat_param
         # NOTE: This assumes uniform sharding with padding across ranks.
@@ -296,7 +306,7 @@ class TestUnshardParams(TestUnshardParamsBase):
         )
 
         def _get_unsharded_storage_size(flat_param: FlatParameter):
-            return flat_param._full_param_padded.storage().size()
+            return flat_param._full_param_padded._typed_storage()._size()
 
         # Validate the expected behavior: the root does not reshard after
         # forward; the non-root reshards after forward; and both reshard after

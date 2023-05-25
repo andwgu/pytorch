@@ -517,6 +517,7 @@ class FlatParamHandle:
             params, fully_sharded_module, self._aligned_numel, use_orig_params  # type: ignore[arg-type]
         )
         self._use_unsharded_views(as_params=False)
+        self._post_backward_hook_tensor: Optional[Tensor] = None
 
     def _init_setattr_fns(self):
         use_unsafe_setattr = os.environ.get(_FSDP_USE_UNSAFE_SETATTR, "") == "1"
@@ -1483,7 +1484,6 @@ class FlatParamHandle:
         Prepares the gradient for optimizer computation by moving the sharded
         gradient to the ``.grad`` attribute.
         """
-
         def cast_grad_to_param_dtype_if_needed(flat_param):
             # TODO (rohan-varma): test for full precision with keep_low_precision_grads
             if not self._force_full_precision and self._keep_low_precision_grads:
@@ -1683,7 +1683,11 @@ class FlatParamHandle:
         """
         flat_param = self.flat_param
         if tensor is None:
-            tensor = flat_param
+            if self._training_state == HandleTrainingState.FORWARD:
+                self._post_backward_hook_tensor = flat_param.view_as(flat_param)
+                tensor = self._post_backward_hook_tensor
+            else:
+                tensor = flat_param
         views = (
             _ext_post_unflatten_transform(subtensor.view(shape), param_extension)
             for (subtensor, shape, param_extension) in zip(
@@ -1706,7 +1710,11 @@ class FlatParamHandle:
         """
         flat_param = self.flat_param
         if tensor is None:
-            tensor = flat_param
+            if self._training_state == HandleTrainingState.FORWARD:
+                self._post_backward_hook_tensor = flat_param.view_as(flat_param)
+                tensor = self._post_backward_hook_tensor
+            else:
+                tensor = flat_param
         splits: List[Tensor] = torch.split(
             tensor, flat_param._numels_with_padding, dim=0
         )

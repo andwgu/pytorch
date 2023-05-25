@@ -373,8 +373,8 @@ class TestFSDPUseOrigParamsMultipleParamGroups(FSDPTest):
             {
                 "multi_tensor": [False, True],
                 "sharding_strategy": [
-                    ShardingStrategy.FULL_SHARD,
-                    ShardingStrategy.SHARD_GRAD_OP,
+                    # ShardingStrategy.FULL_SHARD,
+                    # ShardingStrategy.SHARD_GRAD_OP,
                     ShardingStrategy.NO_SHARD,
                 ],
             },

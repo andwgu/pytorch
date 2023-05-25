@@ -752,10 +752,10 @@ def _post_backward_hook(
         )
         handle._training_state = HandleTrainingState.BACKWARD_POST
 
-        if flat_param.grad is None:
-            return
-        if flat_param.grad.requires_grad:
-            raise RuntimeError("FSDP does not support gradients of gradients")
+        # if flat_param.grad is None:
+        #     return
+        # if flat_param.grad.requires_grad:
+        #     raise RuntimeError("FSDP does not support gradients of gradients")
 
         free_unsharded_flat_param = _should_free_in_backward(state, handle)
         _reshard(state, [handle], [free_unsharded_flat_param])
@@ -778,19 +778,22 @@ def _post_backward_hook(
         )
 
         with state._device_handle.stream(state._streams["post_backward"]):
-            autograd_computed_grad = flat_param.grad.data
+            # autograd_computed_grad = flat_param.grad.data
+            autograd_computed_grad = unused[0]
             if state._exec_order_data.is_first_iter:  # only check once
                 _check_comm_hook(
                     state._communication_hook, state._communication_hook_state
                 )
             if (
                 not _low_precision_hook_enabled(state)
-                and flat_param.grad.dtype != handle._reduce_dtype
+                and unused[0].dtype != handle._reduce_dtype
+                # and flat_param.grad.dtype != handle._reduce_dtype
                 # If we are forcing full precision but communicating grads
                 # (i.e. model.eval()), don't downcast gradient.
                 and not handle._force_full_precision
             ):
-                flat_param.grad.data = flat_param.grad.to(handle._reduce_dtype)
+                unused[0].data = unused[0].to(handle._reduce_dtype)
+                # flat_param.grad.data = flat_param.grad.to(handle._reduce_dtype)
 
             if handle.uses_sharded_strategy:
                 # We clear `.grad` to permit multiple backwards. This avoids a
@@ -798,7 +801,8 @@ def _post_backward_hook(
                 # ahead of the first backward pass reduction, which is possible
                 # since the reduction is issued in a separate stream and is
                 # async and would result in reducing the wrong gradient.
-                unsharded_grad = flat_param.grad.data
+                # unsharded_grad = flat_param.grad.data
+                unsharded_grad = unused[0]
                 flat_param.grad = None
                 chunks = list(unsharded_grad.chunk(state.world_size))
                 numel_to_pad = (
@@ -837,14 +841,17 @@ def _post_backward_hook(
                     flat_param._saved_grad_shard = new_sharded_grad
                 grad_to_offload = flat_param._saved_grad_shard
             else:
+                # flat_param_grad = flat_param.grad
+                flat_param_grad = unused[0]
                 state._communication_hook(
-                    state._communication_hook_state, flat_param.grad
+                    state._communication_hook_state, flat_param_grad
                 )
                 # For `NO_SHARD`, we can keep the low precision gradients by
                 # simply omitting the cast altogether
                 if not handle._keep_low_precision_grads:
-                    _cast_grad_to_param_dtype(state, flat_param.grad, flat_param)
-                grad_to_offload = flat_param.grad.data
+                    _cast_grad_to_param_dtype(state, flat_param_grad, flat_param)
+                flat_param._saved_grad_shard = flat_param_grad
+                grad_to_offload = flat_param_grad.data
 
             if handle._offload_params:
                 # Offload the gradient to CPU to ensure parameters and
@@ -869,6 +876,8 @@ def _post_backward_hook(
             _no_dispatch_record_stream(
                 autograd_computed_grad, state._streams["post_backward"]
             )
+            if handle.uses_sharded_strategy:
+                autograd_computed_grad.untyped_storage().resize_(0)
 
             if handle._use_orig_params:
                 # Since the handle's `FlatParameter` completed its gradient
@@ -877,6 +886,9 @@ def _post_backward_hook(
                 # Delay using sharded gradient views until after the
                 # reduce-scatter instead of immediately after resharding
                 handle._use_sharded_grad_views()
+
+            if not handle.uses_sharded_strategy:
+                return flat_param_grad
 
 
 @no_type_check
@@ -1050,12 +1062,15 @@ def _finalize_params(
         flat_param = handle.flat_param
         if flat_param.requires_grad:
             if hasattr(flat_param, "_post_backward_hook_state"):
-                _p_assert(
-                    len(flat_param._post_backward_hook_state) == 2,
-                    f"Invalid: ``_post_backward_hook_state``: {flat_param._post_backward_hook_state}",
-                )
-                flat_param._post_backward_hook_state[1].remove()
+                _p_assert(len(flat_param._post_backward_hook_state) == 1, f"{flat_param._post_backward_hook_state}")
+                flat_param._post_backward_hook_state[0].remove()
                 delattr(flat_param, "_post_backward_hook_state")
+                # _p_assert(
+                #     len(flat_param._post_backward_hook_state) == 2,
+                #     f"Invalid: ``_post_backward_hook_state``: {flat_param._post_backward_hook_state}",
+                # )
+                # flat_param._post_backward_hook_state[1].remove()
+                # delattr(flat_param, "_post_backward_hook_state")
             if not state._sync_gradients:
                 # Preserve the gradient accumulation state if not synchronizing
                 # gradients: `.grad` remains the unsharded gradient  from prior
@@ -1334,6 +1349,12 @@ def _register_post_backward_hooks(
         already_registered = hasattr(flat_param, "_post_backward_hook_state")
         if already_registered or not flat_param.requires_grad:
             continue
+        _p_assert(handle._post_backward_hook_tensor is not None, "Should be set in pre-forward")
+        hook_handle = handle._post_backward_hook_tensor.register_hook(
+            functools.partial(_post_backward_hook, state, handle)
+        )
+        flat_param._post_backward_hook_state = (hook_handle,)
+        continue
         # Get the `AccumulateGrad` object
         temp_flat_param = flat_param.expand_as(flat_param)
         _p_assert(

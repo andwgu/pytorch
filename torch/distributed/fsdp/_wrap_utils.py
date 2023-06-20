@@ -2,7 +2,7 @@ import collections
 import functools
 import warnings
 from functools import partial
-from typing import Any, Deque, Dict, List, NamedTuple, Set, Tuple
+from typing import Any, Deque, Dict, List, NamedTuple, Set, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -179,3 +179,72 @@ def _record_module_wrapper_cls(
     """
     wrapped_modules_set.add(module)
     return module
+
+
+def _validate_frozen_params(
+    root_module: nn.Module,
+    modules_to_wrap: Set[nn.Module],
+    ignored_params: Set[nn.Parameter],
+):
+    visited_modules = {root_module}
+    stack = [("", root_module)]
+    topo_sorted_named_modules = []
+    while stack:
+        module_name, module = stack.pop()
+        topo_sorted_named_modules.append((module_name, module))
+        for child_module_name, child_module in module.named_children():
+            if child_module is None:  # only for overrides of `named_children()`
+                continue
+            if not child_module in visited_modules:
+                visited_modules.add(child_module)
+                if module_name != "":
+                    child_module_name = module_name + "." + child_module_name
+                stack.append((child_module_name, child_module))
+    reverse_topo_sorted_modules = reversed(topo_sorted_named_modules)
+    visited_modules.clear()
+    for module_name, module in reverse_topo_sorted_modules:
+        if module in modules_to_wrap:
+            param_to_fqn = _get_param_to_fqn(module, ignored_params, visited_modules, module_name)
+            frozen_param_fqns = []
+            nonfrozen_param_fqns = []
+            for param, fqn in param_to_fqn.items():
+                if param.requires_grad:
+                    nonfrozen_param_fqns.append(fqn)
+                else:
+                    frozen_param_fqns.append(fqn)
+            if len(frozen_param_fqns) > 0 and len(nonfrozen_param_fqns) > 0:
+                raise ValueError(
+                    f"{module_name} has both parameters with requires_grad=True "
+                    "and False. FSDP does not support wrapping such modules.\n"
+                    f"The following parameters have requires_grad=True:\n{nonfrozen_param_fqns}\n"
+                    f"The following parameters have requires_grad=False:\n{frozen_param_fqns}"
+                )
+
+
+def _get_param_to_fqn(
+    root_module: nn.Module,
+    ignored_params: Set[nn.Parameter],
+    visited_modules: Set[nn.Module],
+    root_prefix: str,
+) -> Dict[nn.Parameter, str]:
+    param_to_fqn: Dict[nn.Parameter, str] = {}
+    # Run BFS
+    queue = collections.deque([(root_module, root_prefix)])
+    visited_modules.add(root_module)
+    while queue:
+        module, prefix = queue.popleft()
+        for param_name, param in module.named_parameters(recurse=False):
+            if param not in ignored_params:
+                fqn = param_name if prefix == "str" else prefix + "." + param_name
+                param_to_fqn[param] = fqn
+        for child_module_name, child_module in module.named_children():
+            if child_module is None:  # only for overrides of `named_children()`
+                continue
+            if not child_module in visited_modules:
+                visited_modules.add(child_module)
+                child_prefix = child_module_name if prefix == "str" else prefix + "." + child_module_name
+                queue.append((child_module, child_prefix))
+    return param_to_fqn
+
+
+

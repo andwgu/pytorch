@@ -52,7 +52,7 @@ from torch.distributed.fsdp.flat_param import (
     FlatParamHandle,
     HandleShardingStrategy,
 )
-from torch.distributed.fsdp.wrap import _FSDPPolicy
+from torch.distributed.fsdp.wrap import _Policy
 from torch.distributed.utils import _sync_params_and_buffers
 from torch.utils.hooks import RemovableHandle
 
@@ -97,7 +97,7 @@ def _init_process_group_state(
     state: _FSDPState,
     process_group: ProcessGroupType,
     sharding_strategy: ShardingStrategy,
-    policy: Optional[_FSDPPolicy],
+    policy: Optional[_Policy],
 ) -> _FSDPState:
     if sharding_strategy in HYBRID_SHARDING_STRATEGIES:
         if process_group is None and policy is None:

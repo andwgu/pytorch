@@ -252,6 +252,10 @@ def _share_state_and_init_handle_attrs(
                 f"FSDP state missing attribute {attr_name}",
             )
             attr_name_to_values[attr_name].add(getattr(fsdp_state, attr_name))
+        if fsdp_state._handle and fsdp_state._handle._use_fp8:
+            fsdp_state._handle._fp8_post_backward_hook = functools.partial(
+                _post_backward_hook, state=fsdp_state, handle=fsdp_state._handle
+            )
         if fsdp_state is root_state:
             continue
         # Relax the assert for non-root FSDP instances in case the nested
@@ -430,7 +434,8 @@ def _pre_forward(
         # Register post-backward hooks to reshard the parameters and reduce-scatter
         # their gradients. They must be re-registered every forward pass in case
         # the `grad_fn` is mutated.
-        _register_post_backward_hook(state, handle)
+        if not handle or not handle._use_fp8:  # fp8 uses custom autograd function
+            _register_post_backward_hook(state, handle)
         # We have to reallocate the _cpu_grad if optimizer overlap
         # set the grad to None in the backward pass.
         if handle and handle._offload_params and handle.flat_param._cpu_grad is None:
@@ -753,9 +758,9 @@ def _post_backward_hook(
         )
         handle._training_state = HandleTrainingState.BACKWARD_POST
 
-        if flat_param.grad is None:
+        if flat_param.grad is None and not handle._use_fp8:
             return
-        if flat_param.grad.requires_grad:
+        if not handle._use_fp8 and flat_param.grad.requires_grad:
             raise RuntimeError("FSDP does not support gradients of gradients")
 
         _post_backward_reshard(state, handle)
@@ -769,25 +774,36 @@ def _post_backward_hook(
         state._post_backward_stream.wait_stream(state._device_handle.current_stream())
 
         with state._device_handle.stream(state._post_backward_stream):
-            autograd_computed_grad = flat_param.grad.data
+            # HACK: Give the grad as attribute for fp8.
+            autograd_computed_grad = (
+                flat_param.grad.data
+                if not handle._use_fp8
+                else handle._autograd_computed_grad
+            )
             if (
                 not _low_precision_hook_enabled(state)
-                and flat_param.grad.dtype != handle._reduce_dtype
+                and autograd_computed_grad.dtype != handle._reduce_dtype
                 # If we are forcing full precision but communicating grads
                 # (i.e. model.eval() + full precision in eval was configured), don't downcast gradient.
                 and not handle._force_full_precision
             ):
-                flat_param.grad.data = flat_param.grad.to(handle._reduce_dtype)
-            if handle.uses_sharded_strategy:
-                _reduce_grad(state, handle)
+                # flat_param.grad.data = flat_param.grad.to(handle._reduce_dtype)
+                grad = flat_param.grad.to(handle._reduce_dtype)
             else:
-                _reduce_grad_no_shard(state, handle)
+                grad = autograd_computed_grad
+            if handle.uses_sharded_strategy:
+                _reduce_grad(state, handle, grad)
+            else:
+                # TODO: Pass `grad` into this as well?
+                _reduce_grad_no_shard(state, handle, grad)
             # Since the unsharded gradient is produced in the computation
             # stream and consumed in the post-backward stream, inform the
             # caching allocator (before it goes out of scope)
             _no_dispatch_record_stream(
                 autograd_computed_grad, state._post_backward_stream
             )
+            if handle._use_fp8:
+                delattr(handle, "_autograd_computed_grad")
 
 
 def _post_backward_reshard(
@@ -828,7 +844,9 @@ def _should_free_in_backward(
 
 
 @no_type_check
-def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
+def _reduce_grad(
+    state: _FSDPState, handle: FlatParamHandle, unsharded_grad: torch.Tensor
+) -> None:
     """
     For sharded strategies, this runs gradient reduction, sharded gradient
     accumulation if needed, and the post-reduction callback.
@@ -843,7 +861,7 @@ def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
     # pass reduction, which is possible since the reduction is issued in a
     # separate stream and is async and would result in reducing the wrong
     # gradient.
-    unsharded_grad = flat_param.grad.data
+    # unsharded_grad = flat_param.grad.data
     flat_param.grad = None
     padded_unsharded_grad, new_sharded_grad = _get_reduce_scatter_tensors(
         state, unsharded_grad
@@ -922,23 +940,27 @@ def _accumulate_sharded_grad(
 
 
 @no_type_check
-def _reduce_grad_no_shard(state: _FSDPState, handle: FlatParamHandle) -> None:
+def _reduce_grad_no_shard(
+    state: _FSDPState, handle: FlatParamHandle, grad: torch.Tensor
+) -> None:
     """
     For no-shard, this runs gradient reduction (which directly covers any
     gradient accumulation implicitly) and the post-reduction callback.
     """
     flat_param = handle.flat_param
     if state._comm_hook is None:  # default path
-        _div_if_needed(flat_param.grad, state._gradient_predivide_factor)
-        dist.all_reduce(flat_param.grad, group=state.process_group)
-        _div_if_needed(flat_param.grad, state._gradient_postdivide_factor)
+        _div_if_needed(grad, state._gradient_predivide_factor)
+        dist.all_reduce(grad, group=state.process_group)
+        _div_if_needed(grad, state._gradient_postdivide_factor)
     else:
-        state._comm_hook(state._comm_hook_state, flat_param.grad)
+        state._comm_hook(state._comm_hook_state, grad)
     # For `NO_SHARD`, we can keep the low precision gradients by simply
     # omitting the cast altogether
     if not handle._keep_low_precision_grads:
-        _cast_grad_to_param_dtype(state, flat_param.grad, flat_param)
-    grad_to_offload = flat_param.grad.data
+        _cast_grad_to_param_dtype(state, grad, flat_param)
+    grad_to_offload = grad.data
+    if handle._use_fp8:
+        flat_param.grad = grad
     _post_reduce_grad_callback(state, handle, grad_to_offload)
 
 

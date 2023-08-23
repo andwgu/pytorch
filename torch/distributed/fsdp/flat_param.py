@@ -39,6 +39,7 @@ from torch.distributed.utils import _alloc_storage, _free_storage, _p_assert
 from torch.nn.parameter import _ParameterMeta  # type: ignore[attr-defined]
 
 from ._fsdp_extensions import _ext_post_unflatten_transform, _ext_pre_flatten_transform
+from ._fp8_utils import SplitAndViewAsFloat8
 
 __all__ = [
     "FlatParameter",
@@ -537,6 +538,18 @@ class FlatParamHandle:
         self._init_flat_param_and_metadata(
             params, fully_sharded_module, self._aligned_numel, use_orig_params  # type: ignore[arg-type]
         )
+        self._amax_history_to_scale_fn = None
+        self._update_history_with_new_amax_fn = None
+        self._scales = None
+        self._to_float8_fn = None
+        self._to_float8_from_fp8_fn = None
+        self._amaxes = None
+        self._amax_histories = None
+        self._scale_fn_name = None
+        self._fp8_post_backward_hook = None
+        self._unused_leaf = None
+        if self._use_fp8:
+            self._init_fp8_metadata()
         self._use_unsharded_views(as_params=False)
 
     def _init_setattr_fns(self):
@@ -830,8 +843,61 @@ class FlatParamHandle:
         else:
             self._fwd_bwd_param_dtype = mp_param_dtype or self._orig_param_dtype
             self._reduce_dtype = mp_reduce_dtype or self._orig_param_dtype
+        if self._use_fp8:
+            assert self._use_orig_params  # keep life simpler
+            assert self._reduce_dtype in (
+                torch.float16, torch.bfloat16, torch.float32, torch.float64
+            ), f"Invalid reduce dtype for fp8: {self._reduce_dtype}"
+            # TODO: Buffer mixed precision dtype should not be set. Check this
+            # at the FSDP level.
         assert self._fwd_bwd_param_dtype is not None
         assert self._reduce_dtype is not None
+
+    def _init_fp8_metadata(self):
+        flat_param = self.flat_param
+        amaxes: List[Tensor] = []
+        amax_histories: List[Tensor] = []
+        for (param_name, module, _) in flat_param._param_infos:
+            if "Float8Linear" not in str(type(module)):  # HACK
+                raise AssertionError(
+                    "FSDP only supports Float8Linear for fp8 but got "
+                    f"{type(module)} for {param_name}"
+                )
+            if param_name != "weight":
+                raise AssertionError(
+                    f"FSDP only supports weights for fp8 but got {param_name}"
+                )
+            if self._amax_history_to_scale_fn is None:
+                assert self._update_history_with_new_amax_fn is None
+                assert self._to_float8_fn is None
+                assert self._to_float8_from_fp8_fn is None
+                assert self._scale_fn_name is None
+                self._amax_history_to_scale_fn = module._amax_history_to_scale_fn
+                self._update_history_with_new_amax_fn = module._update_history_with_new_amax_fn
+                self._to_float8_fn = module._to_float8_fn
+                self._to_float8_from_fp8_fn = module._to_float8_from_fp8_fn
+                self._scale_fn_name = module.recipe.scale_fn_name
+            else:
+                if (
+                    self._amax_history_to_scale_fn.__code__.co_code != module._amax_history_to_scale_fn.__code__.co_code
+                    or self._update_history_with_new_amax_fn.__code__.co_code != module._update_history_with_new_amax_fn.__code__.co_code
+                    or self._to_float8_fn.__code__.co_code != module._to_float8_fn.__code__.co_code
+                    or self._to_float8_from_fp8_fn.__code__.co_code != module._to_float8_from_fp8_fn.__code__.co_code
+                    or self._scale_fn_name != module.recipe.scale_fn_name
+                ):
+                    raise ValueError(
+                        "Got inconsistent fp8 utility functions"
+                    )
+            if not hasattr(module, "fp8_amax_w"):
+                raise AssertionError(f"{type(module)} is missing the fp8_amax_w buffer")
+            if not hasattr(module, "fp8_amax_history_w"):
+                raise AssertionError(f"{type(module)} is missing the fp8_amax_history_w buffer")
+            amaxes.append(module.fp8_amax_w)
+            amax_histories.append(module.fp8_amax_history_w)
+        self._amaxes = amaxes
+        self._amax_histories = amax_histories
+        self._scales = [None for _ in range(len(amaxes))]
+        self._unused_leaf = torch.empty(0, requires_grad=True, device=self.device)
 
     ###################################
     # SHARD INITIALIZATION & METADATA #
@@ -1214,6 +1280,9 @@ class FlatParamHandle:
         switches to using the low precision sharded flat parameter.
         """
         self._check_low_precision_shard()
+        if self._use_fp8:
+            self._use_fp8_shard()
+            return
         flat_param = self.flat_param
         _alloc_storage(
             flat_param._mp_shard, flat_param._local_shard.size()  # type: ignore[attr-defined]
@@ -1226,6 +1295,39 @@ class FlatParamHandle:
         )
         # Invariant: `_mp_shard` is always on the compute device.
         flat_param.data = flat_param._mp_shard  # type: ignore[attr-defined]
+
+    def _use_fp8_shard(self):
+        flat_param = self.flat_param
+        _p_assert(flat_param._mp_shard.dtype == torch.float8_e4m3fn, f"{flat_param.dtype}")
+        _alloc_storage(
+            flat_param._mp_shard, flat_param._local_shard.size()  # type: ignore[attr-defined]
+        )
+        # Assuming that amax histories are replicated across ranks, compute all
+        # scales to be used post-all-gather to convert fp8 -> float8
+        if self._in_forward:
+            for i, amax_history in enumerate(self._amax_histories):
+                self._scales[i] = self._amax_history_to_scale_fn(
+                    amax_history,
+                    torch.float8_e4m3fn,
+                    self._scale_fn_name,
+                )
+        for param, shard_param_info, amax, scale in zip(
+            flat_param._params,
+            flat_param._shard_param_infos,
+            self._amaxes,
+            self._scales
+        ):
+            if not shard_param_info.in_shard:
+                continue
+            # Converting to float8 updates `amax` in place
+            param_fp8 = self._to_float8_fn(param, scale, torch.float8_e4m3fn, amax)
+            # NOTE: We must all-reduce the amaxes later before updating the
+            # amax histories because the fp32 -> fp8 conversion above only
+            # produces *partial* amax values based on the sharded fp32 data.
+            offset = shard_param_info.offset_in_shard
+            numel_in_shard = shard_param_info.numel_in_shard
+            flat_param._mp_shard[offset : offset + numel_in_shard].view_as(param_fp8._data).copy_(param_fp8._data)
+        flat_param.data = flat_param._mp_shard
 
     def unshard(self):
         """
@@ -1336,11 +1438,24 @@ class FlatParamHandle:
                 tensor_list, sharded_flat_param, group=self.process_group
             )
         else:
+            if self._use_fp8 and not self._force_full_precision:
+                padded_unsharded_flat_param = padded_unsharded_flat_param.view(dtype=torch.uint8)
+                sharded_flat_param = sharded_flat_param.view(dtype=torch.uint8)
             dist.all_gather_into_tensor(
                 padded_unsharded_flat_param,
                 sharded_flat_param,
                 self.process_group,
             )
+            if self._use_fp8 and not self._force_full_precision:
+                padded_unsharded_flat_param = padded_unsharded_flat_param.view(dtype=torch.float8_e4m3fn)
+                sharded_flat_param = sharded_flat_param.view(dtype=torch.float8_e4m3fn)
+                if self._in_forward:
+                    # if self.rank == 0:
+                    #     print(f"All-reducing amaxes!")
+                    with dist._coalescing_manager():
+                        for amax in self._amaxes:
+                            dist.all_reduce(amax, op=dist.distributed_c10d.ReduceOp.MAX)
+
         return padded_unsharded_flat_param
 
     def _use_unsharded_flat_param(
@@ -1365,6 +1480,9 @@ class FlatParamHandle:
                 # `_use_unsharded_views()` to the skipped pre-forward
                 # `_use_sharded_views()`, so we should skip this one too.
                 return
+            if self._use_fp8 and not self._force_full_precision:
+                self._use_unsharded_views_fp8(as_params=(not in_forward and not in_pre_backward))
+                return
             # We use `Tensor` views in the forward so that they are tracked by
             # autograd. We use them in the pre-backward as well to support
             # reentrant activation checkpointing, which needs the views to be
@@ -1373,6 +1491,9 @@ class FlatParamHandle:
                 as_params=(not in_forward and not in_pre_backward)
             )
         elif in_forward:
+            if self._use_fp8 and not self._force_full_precision:
+                self._use_unsharded_views_fp8(as_params=False)
+                return
             self._use_unsharded_views(as_params=False)
 
     def post_unshard(self):
@@ -1833,6 +1954,79 @@ class FlatParamHandle:
                     and self._training_state == HandleTrainingState.FORWARD
                 ):
                     module._parameters[param_name] = param_var
+        for i, (
+            param_name,
+            module,
+            _,
+            prim_param_name,
+            prim_module,
+            _,
+        ) in enumerate(self.flat_param._shared_param_infos):
+            prim_param: Union[Tensor, nn.Parameter] = getattr(
+                prim_module, prim_param_name
+            )
+            _p_assert(
+                not as_params or isinstance(prim_param, nn.Parameter),
+                f"as_params={as_params} type(prim_param)={type(prim_param)}",
+            )
+            if self._use_orig_params and as_params:
+                shared_param = self.flat_param._shared_params[i]
+                self._setattr_param(module, param_name, shared_param)
+                shared_param.data = prim_param
+            elif as_params:
+                self._setattr_param(module, param_name, prim_param)
+            else:
+                self._setattr_tensor(module, param_name, prim_param)
+                if (
+                    self._use_orig_params
+                    and self._training_state == HandleTrainingState.FORWARD
+                ):
+                    module._parameters[param_name] = prim_param
+
+    @no_type_check
+    def _use_unsharded_views_fp8(self, as_params: bool) -> None:
+        flat_param = self.flat_param
+        self._check_unsharded(flat_param)
+        _p_assert(
+            self._fp8_post_backward_hook is not None,
+            "Hook should have been set in lazy init!"
+        )
+        _p_assert(self._unused_leaf is not None, f"Unused leaf should have been set during init!")
+        if self._training_state == HandleTrainingState.FORWARD:
+            _p_assert(torch.is_grad_enabled(), f"Requires grad to be enabled")
+        views_float8 = SplitAndViewAsFloat8.apply(self._unused_leaf, self, self._fp8_post_backward_hook)
+        # TODO: Deduplicate.
+        _p_assert(self._use_orig_params, f"Only support use_orig_params=True (for now)")
+        for i, (view, (param_name, module, _)) in enumerate(
+            zip(views_float8, flat_param._param_infos)
+        ):
+            if as_params:
+                param = self.flat_param._params[i]
+                self._setattr_param(module, param_name, param)
+                param.data = view
+            else:  # `as_params=False`
+                param_var: Tensor = view
+                if self._use_orig_params:
+                    if self._training_state == HandleTrainingState.FORWARD:
+                        # Save the `Tensor` for the pre-backward
+                        self.flat_param._tensors[i] = view  # save for pre-backward
+                    elif self._training_state == HandleTrainingState.BACKWARD_PRE:
+                        # Use the saved `Tensor` variable from the forward to
+                        # preserve the autograd graph so that the post-backward
+                        # hook fires (e.g. for reentrant AC)
+                        tensor = self.flat_param._tensors[i]
+                        tensor.data = view
+                        param_var = tensor
+                # self._setattr_tensor(module, param_name, param_var)
+                # HACK: Give this to the `Float8Linear` via attribute.
+                module._w_fp8 = param_var
+                # if (
+                #     self._use_orig_params
+                #     and self._training_state == HandleTrainingState.FORWARD
+                # ):
+                #     module._parameters[param_name] = param_var
+        if len(self.flat_param._shared_param_infos) > 0:
+            raise NotImplementedError(f"Shared parameters not supported/tested for fp8")
         for i, (
             param_name,
             module,
@@ -2435,6 +2629,14 @@ class FlatParamHandle:
                 assert flat_param._is_grad_none_mask is not None  # mypy
                 flat_param._is_grad_none_mask[i] = False
 
+    def _to_post_backward_state(self):
+        # HACK: This is to avoid circular imports.
+        self._training_state = HandleTrainingState.BACKWARD_POST
+
+    @property
+    def _in_forward(self) -> bool:
+        return self._training_state == HandleTrainingState.FORWARD
+
     #######################
     # CHECKS & INVARIANTS #
     #######################
@@ -2534,6 +2736,10 @@ class FlatParamHandle:
         case it can restore view invariants via ``_use_sharded_views()``.
         """
         return self._unsharded_flat_param_for_skipped_views is not None
+    
+    @property
+    def _use_fp8(self) -> bool:
+        return self._fwd_bwd_param_dtype == torch.float8_e4m3fn
 
 
 # NOTE: These are hacks to bypass `nn.Module.__setattr__` checks.

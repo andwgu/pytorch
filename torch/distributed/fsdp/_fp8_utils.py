@@ -43,16 +43,15 @@ class SplitAndViewAsFloat8(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx,
-        *grads_float8: Tuple["Float8Tensor", ...],
+        *grads_fp32: Tuple[torch.Tensor, ...],
     ):
-        if len(grads_float8) == 0:
+        if len(grads_fp32) == 0:
             return torch.empty_like(ctx.unused_leaf), None, None, None, None
         handle = ctx.handle
-        if handle.rank == 0:
-            print(f"SplitAndViewAsFloat8.backward!")
+        # if handle.rank == 0:
+        #     print(f"SplitAndViewAsFloat8.backward!")
         flat_param = handle.flat_param
         # TODO: Handle custom reduce_dtype.
-        grads_fp32 = [grad.to_original_precision() for grad in grads_float8]
         # TODO: Can validate uniform dtype if desired.
         # Reconstruct an fp32 unsharded gradient including padding
         if handle.uses_sharded_strategy:

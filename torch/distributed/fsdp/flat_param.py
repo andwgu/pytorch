@@ -1320,6 +1320,7 @@ class FlatParamHandle:
                 self._scales[i] = self._amax_history_to_scale_fn(
                     amax_history,
                     torch.float8_e4m3fn,
+                    self._orig_param_dtype,
                     self._scale_fn_name,
                 )
         for param, shard_param_info, amax, scale in zip(
@@ -1329,12 +1330,19 @@ class FlatParamHandle:
             self._scales,
         ):
             if not shard_param_info.in_shard:
+                if self._in_forward:
+                    # Otherwise, last iteration's replicated amax can override
+                    # this iteration's amax in the upcoming all-reduce
+                    amax.fill_(0)
                 continue
             # Converting to float8 updates `amax` in place
-            param_fp8 = self._to_float8_fn(param, scale, torch.float8_e4m3fn, amax)
             # NOTE: We must all-reduce the amaxes later before updating the
             # amax histories because the fp32 -> fp8 conversion above only
             # produces *partial* amax values based on the sharded fp32 data.
+            amax_for_fn = amax if self._in_forward else None  # do not override all-reduced amax
+            param_fp8 = self._to_float8_fn(
+                param, scale, torch.float8_e4m3fn, amax_for_fn, all_reduce=False
+            )
             offset = shard_param_info.offset_in_shard
             numel_in_shard = shard_param_info.numel_in_shard
             flat_param._mp_shard[offset : offset + numel_in_shard].view_as(
@@ -1468,7 +1476,7 @@ class FlatParamHandle:
                 sharded_flat_param = sharded_flat_param.view(dtype=torch.float8_e4m3fn)
                 if self._in_forward:
                     # if self.rank == 0:
-                    #     print(f"All-reducing amaxes!")
+                    #     print(f"All-reducing weight amaxes!")
                     with dist._coalescing_manager():
                         for amax in self._amaxes:
                             dist.all_reduce(amax, op=dist.distributed_c10d.ReduceOp.MAX)

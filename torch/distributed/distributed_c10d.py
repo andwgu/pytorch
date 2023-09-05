@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Optional, Tuple, Union, List
 
 import torch
 from torch._C._distributed_c10d import (
+    AllgatherOptions,
     AllreduceCoalescedOptions,
     AllreduceOptions,
     AllToAllOptions,
@@ -2822,7 +2823,7 @@ def all_gather(tensor_list, tensor, group=None, async_op=False):
 
 
 @_exception_logger
-def all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):
+def all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False, record_stream=True):
     """
     Gather tensors from all ranks and put them in a single output tensor.
 
@@ -2902,7 +2903,9 @@ def all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=Fal
         else:
             return None
 
-    work = group._allgather_base(output_tensor, input_tensor)
+    opts = AllgatherOptions()
+    opts.recordStream = record_stream
+    work = group._allgather_base(output_tensor, input_tensor, opts)
 
     if async_op:
         return work

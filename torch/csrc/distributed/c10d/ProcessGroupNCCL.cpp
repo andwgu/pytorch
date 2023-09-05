@@ -516,7 +516,7 @@ void ProcessGroupNCCL::WorkNCCL::synchronizeStreams() {
     (*ncclEndEvents_)[i].block(currentStream);
   }
 
-  if (avoidRecordStreams_) {
+  if (avoidRecordStreams_ || stashed_for_allocator_safety_) {
     stashed_for_allocator_safety_->clear();
   }
 }
@@ -1688,7 +1688,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
     PreProcess pre,
     PostProcess post,
     OpType opType,
-    const char* profilingTitle) {
+    const char* profilingTitle,
+    bool recordStream) {
   c10::cuda::CaptureStatus capture_status =
       c10::cuda::currentStreamCaptureStatusMayInitCtx();
   errorIfCapturingNonCapturableNCCL(capture_status);
@@ -1738,7 +1739,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
   // Store references to outputs to be used by WorkNCCL::result and operator<<.
   work->outputs_ = std::make_shared<std::vector<at::Tensor>>(outputs);
 
-  if (avoidRecordStreams_) {
+  if (avoidRecordStreams_ || !recordStream) {
     work->stashed_for_allocator_safety_ =
         std::make_shared<std::vector<at::Tensor>>(inputs);
   }
@@ -1781,7 +1782,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
       // operations where `inputs' and `outputs' are not the same.
       //
       // See [Sync Streams].
-      if (!avoidRecordStreams_) {
+      if (!avoidRecordStreams_ && recordStream) {
         if (!inputs[i].is_sparse()) {
           c10::cuda::CUDACachingAllocator::recordStream(
               inputs[i].storage().data_ptr(), ncclStream);
@@ -2040,7 +2041,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
     std::vector<at::Tensor>& outputs,
     Fn fn,
     OpType opType,
-    const char* profilingTitle) {
+    const char* profilingTitle,
+    bool recordStream) {
   return collective(
       inputs,
       outputs,
@@ -2050,7 +2052,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::collective(
       [](std::vector<at::cuda::CUDAStream>&,
          c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL>& work) {},
       opType,
-      profilingTitle);
+      profilingTitle,
+      recordStream);
 }
 
 template <typename Fn>
@@ -3308,7 +3311,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::recvAnysource(
 c10::intrusive_ptr<Work> ProcessGroupNCCL::_allgather_base(
     at::Tensor& output_tensor,
     at::Tensor& input_tensor,
-    const AllgatherOptions& /*unused */) {
+    const AllgatherOptions& opts) {
   check_gpu_single_tensor(input_tensor);
   check_gpu_single_tensor(output_tensor);
 
@@ -3334,7 +3337,7 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::_allgather_base(
           at::Tensor& output,
           ncclComm_t comm,
           at::cuda::CUDAStream& stream) {
-        if (!avoidRecordStreams_) {
+        if (!avoidRecordStreams_ && opts.recordStream) {
           c10::cuda::CUDACachingAllocator::recordStream(
               output.storage().data_ptr(), stream);
         }
@@ -3347,7 +3350,8 @@ c10::intrusive_ptr<Work> ProcessGroupNCCL::_allgather_base(
             stream.stream());
       },
       OpType::_ALLGATHER_BASE,
-      "nccl:_all_gather_base");
+      "nccl:_all_gather_base",
+      opts.recordStream);
 }
 
 #ifdef USE_NCCL_WITH_UCC

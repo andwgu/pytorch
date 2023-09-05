@@ -541,7 +541,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
       std::vector<at::Tensor>& output,
       Fn fn,
       OpType opType,
-      const char* profilingTitle = nullptr);
+      const char* profilingTitle = nullptr,
+      bool recordStream = true);
   template <typename Fn, typename PreProcess, typename PostProcess>
   c10::intrusive_ptr<Work> collective(
       std::vector<at::Tensor>& input,
@@ -550,7 +551,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
       PreProcess pre,
       PostProcess post,
       OpType opType,
-      const char* profilingTitle = nullptr);
+      const char* profilingTitle = nullptr,
+      bool recordStream = true);
 
   // Helper that encapsulates work shared across point-to-point communication
   // primitives. It is the same structure as the helper used for collective

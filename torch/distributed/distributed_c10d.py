@@ -3307,7 +3307,7 @@ def reduce_scatter(output, input_list, op=ReduceOp.SUM, group=None, async_op=Fal
 
 
 @_exception_logger
-def reduce_scatter_tensor(output, input, op=ReduceOp.SUM, group=None, async_op=False):
+def reduce_scatter_tensor(output, input, op=ReduceOp.SUM, group=None, async_op=False, record_stream=True):
     """
     Reduces, then scatters a tensor to all ranks in a group.
 
@@ -3370,6 +3370,7 @@ def reduce_scatter_tensor(output, input, op=ReduceOp.SUM, group=None, async_op=F
 
     opts = ReduceScatterOptions()
     opts.reduceOp = op
+    opts.recordStream = record_stream
 
     group = group or _get_default_group()
 

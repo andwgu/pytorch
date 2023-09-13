@@ -28,14 +28,9 @@ class SplitAndViewAsFloat8(torch.autograd.Function):
             views_fp8.append(split.view(flat_param._shapes[idx]))
             idx += 1
         assert len(views_fp8) == len(handle._amaxes)
-        assert len(views_fp8) == len(handle._amax_histories)
         assert len(views_fp8) == len(handle._scales)
-        # Assume that amaxes were all-reduced to become replicated before this
-        if handle._in_forward:
-            for amax, amax_history in zip(handle._amaxes, handle._amax_histories):
-                handle._update_history_with_new_amax_fn(amax, amax_history)
         views_float8 = tuple(
-            handle._to_float8_from_fp8_fn(view_fp8, scale)
+            handle._to_float8_from_fp8_fn(view_fp8, scale, handle._orig_param_dtype)
             for view_fp8, scale in zip(views_fp8, handle._scales)
         )
         return views_float8

@@ -538,14 +538,10 @@ class FlatParamHandle:
         self._init_flat_param_and_metadata(
             params, fully_sharded_module, self._aligned_numel, use_orig_params  # type: ignore[arg-type]
         )
-        self._amax_history_to_scale_fn = None
-        self._update_history_with_new_amax_fn = None
         self._scales = None
         self._to_float8_fn = None
         self._to_float8_from_fp8_fn = None
         self._amaxes = None
-        self._amax_histories = None
-        self._scale_fn_name = None
         self._fp8_post_backward_hook = None
         self._unused_leaf = None
         if self._use_fp8:
@@ -859,7 +855,7 @@ class FlatParamHandle:
     def _init_fp8_metadata(self):
         flat_param = self.flat_param
         amaxes: List[Tensor] = []
-        amax_histories: List[Tensor] = []
+        scales: List[Tensor] = []
         for param_name, module, _ in flat_param._param_infos:
             if "Float8Linear" not in str(type(module)):  # HACK
                 raise AssertionError(
@@ -870,42 +866,28 @@ class FlatParamHandle:
                 raise AssertionError(
                     f"FSDP only supports weights for fp8 but got {param_name}"
                 )
-            if self._amax_history_to_scale_fn is None:
-                assert self._update_history_with_new_amax_fn is None
-                assert self._to_float8_fn is None
+            if self._to_float8_fn is None:
                 assert self._to_float8_from_fp8_fn is None
-                assert self._scale_fn_name is None
-                self._amax_history_to_scale_fn = module._amax_history_to_scale_fn
-                self._update_history_with_new_amax_fn = (
-                    module._update_history_with_new_amax_fn
-                )
                 self._to_float8_fn = module._to_float8_fn
                 self._to_float8_from_fp8_fn = module._to_float8_from_fp8_fn
-                self._scale_fn_name = module.recipe.scale_fn_name
             else:
                 if (
-                    self._amax_history_to_scale_fn.__code__.co_code
-                    != module._amax_history_to_scale_fn.__code__.co_code
-                    or self._update_history_with_new_amax_fn.__code__.co_code
-                    != module._update_history_with_new_amax_fn.__code__.co_code
-                    or self._to_float8_fn.__code__.co_code
+                    self._to_float8_fn.__code__.co_code
                     != module._to_float8_fn.__code__.co_code
                     or self._to_float8_from_fp8_fn.__code__.co_code
                     != module._to_float8_from_fp8_fn.__code__.co_code
-                    or self._scale_fn_name != module.recipe.scale_fn_name
                 ):
                     raise ValueError("Got inconsistent fp8 utility functions")
             if not hasattr(module, "fp8_amax_w"):
                 raise AssertionError(f"{type(module)} is missing the fp8_amax_w buffer")
-            if not hasattr(module, "fp8_amax_history_w"):
+            if not hasattr(module, "fp8_scale_w"):
                 raise AssertionError(
-                    f"{type(module)} is missing the fp8_amax_history_w buffer"
+                    f"{type(module)} is missing the fp8_scale_w buffer"
                 )
             amaxes.append(module.fp8_amax_w)
-            amax_histories.append(module.fp8_amax_history_w)
+            scales.append(module.fp8_scale_w)
         self._amaxes = amaxes
-        self._amax_histories = amax_histories
-        self._scales = [None for _ in range(len(amaxes))]
+        self._scales = scales
         self._unused_leaf = torch.empty(0, requires_grad=True, device=self.device)
 
     ###################################
@@ -1313,16 +1295,6 @@ class FlatParamHandle:
         _alloc_storage(
             flat_param._mp_shard, flat_param._local_shard.size()  # type: ignore[attr-defined]
         )
-        # Assuming that amax histories are replicated across ranks, compute all
-        # scales to be used post-all-gather to convert fp8 -> float8
-        if self._in_forward:
-            for i, amax_history in enumerate(self._amax_histories):
-                self._scales[i] = self._amax_history_to_scale_fn(
-                    amax_history,
-                    torch.float8_e4m3fn,
-                    self._orig_param_dtype,
-                    self._scale_fn_name,
-                )
         for param, shard_param_info, amax, scale in zip(
             flat_param._params,
             flat_param._shard_param_infos,
@@ -1330,19 +1302,16 @@ class FlatParamHandle:
             self._scales,
         ):
             if not shard_param_info.in_shard:
-                if self._in_forward:
-                    # Otherwise, last iteration's replicated amax can override
-                    # this iteration's amax in the upcoming all-reduce
-                    amax.fill_(0)
                 continue
-            # Converting to float8 updates `amax` in place
             # NOTE: We must all-reduce the amaxes later before updating the
             # amax histories because the fp32 -> fp8 conversion above only
             # produces *partial* amax values based on the sharded fp32 data.
-            amax_for_fn = amax if self._in_forward else None  # do not override all-reduced amax
+            amax_for_fn = (
+                amax if self._in_forward else None
+            )  # only need to fill amax in forward
             param_fp8 = self._to_float8_fn(
-                param, scale, torch.float8_e4m3fn, amax_for_fn, all_reduce=False
-            )
+                param, scale, torch.float8_e4m3fn, amax_for_fn
+            )  # updates amax in-place
             offset = shard_param_info.offset_in_shard
             numel_in_shard = shard_param_info.numel_in_shard
             flat_param._mp_shard[offset : offset + numel_in_shard].view_as(
@@ -1473,13 +1442,6 @@ class FlatParamHandle:
                 padded_unsharded_flat_param = padded_unsharded_flat_param.view(
                     dtype=torch.float8_e4m3fn
                 )
-                sharded_flat_param = sharded_flat_param.view(dtype=torch.float8_e4m3fn)
-                if self._in_forward:
-                    # if self.rank == 0:
-                    #     print(f"All-reducing weight amaxes!")
-                    with dist._coalescing_manager():
-                        for amax in self._amaxes:
-                            dist.all_reduce(amax, op=dist.distributed_c10d.ReduceOp.MAX)
 
         return padded_unsharded_flat_param
 

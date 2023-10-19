@@ -50,6 +50,7 @@ def einop_rule(
     *,
     linearity: bool = False,
     enforce_sharding: Optional[Dict[str, int]] = None,
+    pointwise: bool = False,
 ) -> OutputSharding:
     """
     Propagate the sharding of inputs to output for ops whose data
@@ -112,7 +113,12 @@ def einop_rule(
             # dimension with the occurrence from each input
             pending_sums_counter[sum_dim] = pending_sums_counter.get(sum_dim, 0) + 1
 
-        for idx, (dim, mesh_dim) in enumerate(zip(input_dim, input_spec.dim_map)):
+        for idx, (dim, mesh_dim) in enumerate(
+            zip(
+                input_dim,
+                input_spec.dim_map if not pointwise else input_spec.dim_map_pointwise,
+            )
+        ):
             if enforce_sharding and dim in enforce_sharding:
                 if enforce_sharding[dim] != mesh_dim:
                     needs_reshard = True
@@ -272,11 +278,13 @@ def pointwise_rule(op_schema: OpSchema, linearity: bool = False) -> OutputShardi
     enforce_sharding: Dict[str, int] = {}
     if _is_inplace_op(op_schema.op):
         # inplace op should keep the input sharding it writes to
-        for out_dimchar, mesh_dim in zip(out_dimchars, input_specs[0].dim_map):
+        for out_dimchar, mesh_dim in zip(
+            out_dimchars, input_specs[0].dim_map_pointwise
+        ):
             enforce_sharding[out_dimchar] = mesh_dim
     elif _is_out_variant_op(op_schema.op):
         out_spec = cast(DTensorSpec, op_schema.kwargs_schema["out"])
-        for out_dimchar, mesh_dim in zip(out_dimchars, out_spec.dim_map):
+        for out_dimchar, mesh_dim in zip(out_dimchars, out_spec.dim_map_pointwise):
             enforce_sharding[out_dimchar] = mesh_dim
 
     return einop_rule(
@@ -284,6 +292,7 @@ def pointwise_rule(op_schema: OpSchema, linearity: bool = False) -> OutputShardi
         op_schema,
         linearity=linearity,
         enforce_sharding=enforce_sharding,
+        pointwise=True,
     )
 
 

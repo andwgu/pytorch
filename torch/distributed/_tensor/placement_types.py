@@ -468,6 +468,8 @@ class DTensorSpec:
             if placement.is_shard():
                 shard_dim = cast(Shard, placement).dim
                 if r[shard_dim] > -1:
+                    import traceback
+                    traceback.print_stack()
                     raise ValueError(
                         f"Tensor dim {shard_dim} is already sharded on mesh dim {r[shard_dim]},"
                         " DTensor operator implementation does not support things like hybrid"
@@ -475,6 +477,16 @@ class DTensorSpec:
                     )
                 r[shard_dim] = i
         return r
+
+    @property
+    def dim_map_pointwise(self) -> List[int]:
+        r = [-1] * self.ndim
+        for i, placement in enumerate(self.placements):
+            if placement.is_shard():
+                shard_dim = cast(Shard, placement).dim
+                r[shard_dim] = i
+        return r
+
 
     @property
     def sums(self) -> List[int]:

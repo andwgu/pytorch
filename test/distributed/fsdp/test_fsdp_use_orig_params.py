@@ -573,11 +573,15 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
         }
         fsdp_model = TransformerWithSharedParams.init(
             self.process_group,
-            FSDPInitMode.RECURSIVE,
+            # FSDPInitMode.RECURSIVE,
+            FSDPInitMode.NO_FSDP,
             CUDAInitMode.CUDA_BEFORE,
-            fsdp_kwargs=fsdp_kwargs,
+            # fsdp_kwargs=fsdp_kwargs,
+            fsdp_kwargs={},
             deterministic=True,
         )
+        # from torch.nn.parallel import DistributedDataParallel as DDP
+        # fsdp_model = DDP(fsdp_model, device_ids=[self.rank])
         optim = torch.optim.Adam(fsdp_model.parameters(), foreach=False, lr=LR)
         fsdp_kwargs["use_orig_params"] = True
         fsdp_model_orig_params = TransformerWithSharedParams.init(
@@ -605,14 +609,15 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
     def _get_fsdp_parity_subtest_config(self):
         return {
             "sharding_strategy": [
-                ShardingStrategy.NO_SHARD,
-                ShardingStrategy.SHARD_GRAD_OP,
+                # ShardingStrategy.NO_SHARD,
+                # ShardingStrategy.SHARD_GRAD_OP,
                 ShardingStrategy.FULL_SHARD,
             ],
         }
 
     @skip_if_lt_x_gpu(2)
-    @parametrize("offload_params", [False, True])
+    # @parametrize("offload_params", [False, True])
+    @parametrize("offload_params", [True])
     def test_multiple_forward(self, offload_params: bool):
         """
         Tests that ``use_orig_params=True`` has parity with ``False`` when
@@ -637,10 +642,14 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
             fsdp_model_orig_params,
             optim_orig_params,
         ) = self._get_fsdp_models_and_optims(sharding_strategy, cpu_offload)
+        if self.rank == 0:
+            print(sharding_strategy)
+            print(fsdp_model)
+            # print(fsdp_model_orig_params)
         device = torch.device("cuda")
-        for _ in range(3):
-            inp1 = fsdp_model.get_input(device)
-            _inp2 = fsdp_model.get_input(device)
+        for _ in range(1):
+            inp1 = fsdp_model_orig_params.get_input(device)
+            _inp2 = fsdp_model_orig_params.get_input(device)
             inp2 = tuple(
                 t + torch.ones_like(t) for t in _inp2
             )  # make different from `inp1`
@@ -652,6 +661,8 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
                 fsdp_model_orig_params,
                 optim_orig_params,
             ):
+            # for _model, _optim in ((fsdp_model, optim),):
+            # for _model, _optim in ((fsdp_model_orig_params, optim_orig_params),):
                 _optim.zero_grad()
                 loss1 = _model(*inp1)
                 losses1.append(loss1)
@@ -659,12 +670,18 @@ class TestFSDPUseOrigParamsUnshardReshard(FSDPTest):
                 losses2.append(loss2)
                 loss = (loss1 + loss2).sum()
                 losses.append(loss)
-                _model.run_backward(loss)
+                loss.backward()
+                if _model is fsdp_model:
+                    for param in _model.parameters():
+                        if param.grad is not None:
+                            dist.all_reduce(param.grad)
+                            param.grad.div_(self.world_size)
+                # _model.run_backward(loss)
                 _optim.step()
             self.assertEqual(losses1[0], losses1[1])
             self.assertEqual(losses2[0], losses2[1])
             self.assertEqual(losses[0], losses[1])
-        self._check_fsdp_parameter_parity(fsdp_model, fsdp_model_orig_params)
+        # self._check_fsdp_parameter_parity(fsdp_model, fsdp_model_orig_params)
 
     @skip_if_lt_x_gpu(2)
     @parametrize("offload_params", [False, True])

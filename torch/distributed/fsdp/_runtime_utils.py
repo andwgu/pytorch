@@ -163,6 +163,11 @@ def _lazy_init(
     _assert_in_training_states(state, [TrainingState.IDLE])
     _check_flat_params_on_expected_device(state, root_module)
     state._all_fsdp_states = traversal_utils._get_fsdp_states(root_module)
+    for module_name, module in root_module.named_modules():
+        if isinstance(module, _FSDPState):
+            module._fqn = module_name
+            if module._handle:
+                module._handle._fqn = module_name
     _init_streams(state)
     buffers, buffer_dtypes = _get_buffers_and_dtypes_for_computation(state, root_module)
     _cast_buffers_to_dtype_and_device(buffers, buffer_dtypes, state.compute_device)
@@ -655,7 +660,11 @@ def _pre_backward_hook(
     # Only run the pre-backward hook once per group of handles involved in the
     # same module forward computation
     if handle and handle._ran_pre_backward_hook:
+        if state.rank == 0:
+            print(f"[_pre_backward_hook] already ran for {state._fqn}")
         return
+    if state.rank == 0:
+        print(f"[_pre_backward_hook] running for {state._fqn}")
 
     with torch.profiler.record_function("FullyShardedDataParallel._pre_backward_hook"):
         # Queue the post-backward callback once for the root FSDP instance to
@@ -719,6 +728,9 @@ def _post_backward_hook(
     - Otherwise, the ``_saved_grad_shard`` attribute is the reduced sharded
     gradient (accumulating with any existing gradient).
     """
+    return
+    if state.rank == 0:
+        print(f"[_post_backward_hook] running for {handle._fqn}")
     _log_post_backward_hook(state, handle, log)
     flat_param = handle.flat_param
     flat_param._post_backward_called = True
@@ -1072,6 +1084,8 @@ def _post_backward_final_callback(
     This runs at the end of the entire backward pass and should only be called
     on the root FSDP instance.
     """
+    if state.rank == 0:
+        print(f"[final callback] {state._fqn}")
     _p_assert(
         state._is_root,
         "The post-backward callback should only be called on the root FSDP instance",

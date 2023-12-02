@@ -475,6 +475,7 @@ def _init_core_state(
     state._handle = _handle
     params: List[FlatParameter] = []
     state.params = params
+    state._fqn = ""
     return state
 
 

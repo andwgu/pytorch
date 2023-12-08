@@ -1,10 +1,14 @@
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from torch.utils._contextlib import _DecoratorContextManager
 
-from ._fsdp_common import print_and_raise_internal, to_dtype_if_needed
+from ._fsdp_common import (
+    print_and_raise_internal,
+    to_dtype_if_needed,
+    unsafe_alloc_storage,
+)
 from ._fsdp_param import FSDPParam, ShardedState
 
 
@@ -50,6 +54,20 @@ class AllGatherStateHolder:
         return state
 
 
+AllGatherKey = Tuple[int, Tuple[FSDPParam, ...]]
+ReduceScatterKey = Tuple[FSDPParam, ...]
+
+
+class AllGatherOutputSplits(NamedTuple):
+    all_gather_output: torch.Tensor
+    all_gather_splits: Tuple[torch.Tensor, ...]
+
+
+class ReduceScatterInputSplits(NamedTuple):
+    reduce_scatter_input: torch.Tensor
+    reduce_scatter_splits: Tuple[torch.Tensor, ...]
+
+
 @torch.no_grad()
 def foreach_all_gather(
     fsdp_params: List[FSDPParam],
@@ -59,6 +77,7 @@ def foreach_all_gather(
     all_gather_stream: torch.cuda.Stream,
     use_uint8: bool,
     device: torch.device,
+    all_gather_splits_cache: Dict[AllGatherKey, AllGatherOutputSplits],
 ) -> Optional[AllGatherResult]:
     """
     Args:
@@ -91,20 +110,27 @@ def foreach_all_gather(
     dtype = torch.uint8 if use_uint8 else fsdp_params[0].unsharded_param_data_dtype
     world_size = group.size()
     group_rank = group.rank()
-    if use_uint8:
-        total_padded_unsharded_numel = sum(
-            fsdp_param.padded_unsharded_bytes for fsdp_param in fsdp_params
-        )
-    else:
-        total_padded_unsharded_numel = sum(
-            fsdp_param.padded_unsharded_numel for fsdp_param in fsdp_params
-        )
-    total_sharded_numel = total_padded_unsharded_numel // world_size
+    all_gather_key = (world_size, tuple(fsdp_params))
     with torch.cuda.stream(all_gather_copy_in_stream):
+        if all_gather_key in all_gather_splits_cache:
+            all_gather_output = all_gather_splits_cache[
+                all_gather_key
+            ].all_gather_output
+            unsafe_alloc_storage(all_gather_output, all_gather_output.size())
+            total_sharded_numel = all_gather_output.numel() // world_size
+        else:
+            total_padded_unsharded_numel = (
+                sum(fsdp_param.padded_unsharded_bytes for fsdp_param in fsdp_params)
+                if use_uint8
+                else sum(
+                    fsdp_param.padded_unsharded_numel for fsdp_param in fsdp_params
+                )
+            )
+            all_gather_output = torch.empty(
+                (total_padded_unsharded_numel,), dtype=dtype, device=device
+            )
+            total_sharded_numel = total_padded_unsharded_numel // world_size
         # - Copy in
-        all_gather_output = torch.empty(
-            (total_padded_unsharded_numel,), dtype=dtype, device=device
-        )
         all_gather_input = all_gather_output.narrow(
             0, total_sharded_numel * group_rank, total_sharded_numel
         )
@@ -135,20 +161,28 @@ def foreach_all_gather_copy_out(
     fsdp_params: List[FSDPParam],
     group: dist.ProcessGroup,
     use_uint8: bool,
+    all_gather_splits_cache: Dict[AllGatherKey, AllGatherOutputSplits],
 ) -> None:
     world_size = group.size()
-    if use_uint8:
-        split_sizes_per_rank = [
-            fsdp_param.all_gather_input_numel
-            * fsdp_param.unsharded_param_data_dtype.itemsize
-            for fsdp_param in fsdp_params
-        ]
+    all_gather_key = (world_size, tuple(fsdp_params))
+    if all_gather_key in all_gather_splits_cache:
+        splits = all_gather_splits_cache[all_gather_key].all_gather_splits
     else:
-        split_sizes_per_rank = [
-            fsdp_param.all_gather_input_numel for fsdp_param in fsdp_params
-        ]
-    split_sizes = split_sizes_per_rank * world_size
-    splits = torch.split(all_gather_output, split_sizes, dim=0)
+        if use_uint8:
+            split_sizes_per_rank = [
+                fsdp_param.all_gather_input_numel
+                * fsdp_param.unsharded_param_data_dtype.itemsize
+                for fsdp_param in fsdp_params
+            ]
+        else:
+            split_sizes_per_rank = [
+                fsdp_param.all_gather_input_numel for fsdp_param in fsdp_params
+            ]
+        split_sizes = split_sizes_per_rank * world_size
+        splits = torch.split(all_gather_output, split_sizes, dim=0)
+        all_gather_splits_cache[all_gather_key] = AllGatherOutputSplits(
+            all_gather_output, splits
+        )
     num_fsdp_params = len(fsdp_params)
     all_param_shards: List[List[torch.Tensor]] = []
     outs: List[torch.Tensor] = []

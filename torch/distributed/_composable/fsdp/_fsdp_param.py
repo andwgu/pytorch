@@ -20,6 +20,8 @@ from ._fsdp_common import (
     pad_tensor_on_dim0,
     ParamModuleInfo,
     print_and_raise_internal,
+    unsafe_alloc_storage,
+    unsafe_free_storage,
 )
 
 
@@ -590,19 +592,6 @@ class FSDPParam:
             print_and_raise_internal(
                 f"Expects to be in the UNSHARDED state, not {self.state}"
             )
-
-
-# NOTE: Unsafe here refers to not checking whether the storage is already
-# allocated or freed, respectively. We should be safe to use them since we
-# explicitly manage the state transition.
-def unsafe_alloc_storage(tensor: torch.Tensor, size: torch.Size) -> None:
-    # Skip the already-allocated check to save CPU overhead
-    tensor.untyped_storage().resize_(size.numel() * tensor.element_size())
-
-
-def unsafe_free_storage(tensor: torch.Tensor) -> None:
-    # Skip the already-freed check to save CPU overhead
-    tensor.untyped_storage().resize_(0)
 
 
 # NOTE: These are hacks to bypass `nn.Module.__setattr__` checks, which incur

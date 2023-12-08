@@ -197,3 +197,16 @@ def to_dtype_if_needed(
     if dtype is not None and tensor.dtype != dtype:
         return tensor.to(dtype)
     return tensor
+
+
+# NOTE: Unsafe here refers to not checking whether the storage is already
+# allocated or freed, respectively. We should be safe to use them since we
+# explicitly manage the state transition.
+def unsafe_alloc_storage(tensor: torch.Tensor, size: torch.Size) -> None:
+    # Skip the already-allocated check to save CPU overhead
+    tensor.untyped_storage().resize_(size.numel() * tensor.element_size())
+
+
+def unsafe_free_storage(tensor: torch.Tensor) -> None:
+    # Skip the already-freed check to save CPU overhead
+    tensor.untyped_storage().resize_(0)

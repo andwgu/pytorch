@@ -15,12 +15,16 @@ from torch.utils.hooks import RemovableHandle
 
 from ._fsdp_api import MixedPrecisionPolicy, OffloadPolicy
 from ._fsdp_collectives import (
+    AllGatherKey,
+    AllGatherOutputSplits,
     AllGatherResult,
     AllGatherState,
     AllGatherStateHolder,
     foreach_all_gather,
     foreach_all_gather_copy_out,
     foreach_reduce_scatter,
+    ReduceScatterInputSplits,
+    ReduceScatterKey,
 )
 from ._fsdp_common import (
     FSDP_ENABLE_LOGGING,
@@ -30,6 +34,7 @@ from ._fsdp_common import (
     ParamModuleInfo,
     print_and_raise_internal,
     TrainingState,
+    unsafe_free_storage,
 )
 from ._fsdp_param import FSDPParam, ShardedState
 
@@ -134,6 +139,11 @@ class FSDPParamGroup:
         # can be disabled if microbatching the backward
         self._wait_for_grad_sync: bool = True
         self._init_gradient_divide_factors()
+
+        self._all_gather_splits_cache: Dict[AllGatherKey, AllGatherOutputSplits] = {}
+        self._reduce_scatter_splits_cache: Dict[
+            ReduceScatterKey, ReduceScatterInputSplits
+        ] = {}
 
         # - CUDA events for stream synchronization
         # Holds the all-gather output buffer as a list of per-rank shards
@@ -245,6 +255,7 @@ class FSDPParamGroup:
             self._all_gather_stream_for_unshard,
             self._use_uint8_all_gather,
             self._device,
+            self._all_gather_splits_cache,
         )
 
     def _wait_for_unshard(self):
@@ -264,12 +275,22 @@ class FSDPParamGroup:
         if self._training_state == TrainingState.FORWARD:  # implicit prefetch
             if prev_all_gather_state := self.all_gather_state.pop():
                 self._wait_all_gather_streams_on_event(prev_all_gather_state.event)
+                # If a module is all-gathered twice back-to-back, we should not
+                # free the all-gather output
+                if (
+                    prev_all_gather_state.all_gather_result.all_gather_output
+                    is not self._all_gather_result.all_gather_output
+                ):
+                    unsafe_free_storage(
+                        prev_all_gather_state.all_gather_result.all_gather_output
+                    )
                 del prev_all_gather_state  # free
         foreach_all_gather_copy_out(
             self._all_gather_result.all_gather_output,
             self.fsdp_params,
             self._all_gather_process_group,
             self._use_uint8_all_gather,
+            self._all_gather_splits_cache,
         )
         for fsdp_param in self.fsdp_params:
             fsdp_param.to_unsharded()
@@ -281,6 +302,7 @@ class FSDPParamGroup:
             )
         else:
             self._wait_all_gather_streams_on_event(all_gather_copy_out_event)
+            unsafe_free_storage(self._all_gather_result.all_gather_output)
         self._all_gather_result = None  # free unless saved in `all_gather_state`
 
     def _wait_all_gather_streams_on_event(self, event: torch.cuda.Event):
@@ -554,11 +576,12 @@ class FSDPParamGroup:
                 )
         return state
 
-    @property
-    def _all_gather_process_group(self) -> dist.ProcessGroup:
+    def _get_all_gather_process_group(
+        self, sharded_state: ShardedState
+    ) -> dist.ProcessGroup:
         mesh_info = (
             cast(FSDPMeshInfo, self.post_forward_mesh_info)
-            if self._sharded_state == ShardedState.SHARDED_POST_FORWARD
+            if sharded_state == ShardedState.SHARDED_POST_FORWARD
             else self.mesh_info
         )
         group = mesh_info.shard_process_group
@@ -567,6 +590,10 @@ class FSDPParamGroup:
                 f"Mesh without a shard mesh dim does not need all-gather: {mesh_info.mesh}"
             )
         return group
+
+    @property
+    def _all_gather_process_group(self) -> dist.ProcessGroup:
+        return self._get_all_gather_process_group(self._sharded_state)
 
     @property
     def _reduce_scatter_process_group(self) -> dist.ProcessGroup:

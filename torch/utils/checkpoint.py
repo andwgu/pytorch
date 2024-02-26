@@ -21,7 +21,7 @@ from weakref import ReferenceType
 import torch
 import torch.fx.traceback as fx_traceback
 from torch._functorch._aot_autograd.functional_utils import is_fun
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_map, tree_flatten
 from torch.testing._internal.logging_tensor import capture_logs, LoggingTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -1219,6 +1219,17 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
                 out = func(*args, **kwargs)
             return out
 
+    # def __exit__(self, *args, **kwargs):
+    #     if torch.distributed.get_rank() == 0:
+    #     # if True:
+    #         print(f"Exiting CachingMode!")
+    #         for func, l in self.storage.items():
+    #             shapes = []
+    #             for obj in l:
+    #                 flat_obj, _ = tree_flatten(obj)
+    #             shapes = [t.shape for t in flat_obj if torch.is_tensor(t)]
+    #             print(f"{func.__name__}: {shapes}")
+
 
 class _CachedTorchDispatchMode(TorchDispatchMode):
     r"""
@@ -1428,6 +1439,10 @@ def _checkpoint_without_reentrant_generator(
 
     with _checkpoint_hook(new_frame), forward_context:
         yield
+    # if torch.distributed.get_rank() == 0:
+    #     print(f"Exited checkpoint context for {fn}!")
+    #     print()
+    #     print()
     new_frame.forward_completed = True
 
     if getattr(device_module, "_initialized", False) and \

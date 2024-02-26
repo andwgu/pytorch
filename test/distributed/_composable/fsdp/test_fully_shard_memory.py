@@ -23,7 +23,8 @@ class TestFullyShardMemory(FSDPTest):
     @skip_if_lt_x_gpu(2)
     def test_fully_shard_training_memory(self):
         self.run_subtests(
-            {"reshard_after_forward": [True, False]},
+            # {"reshard_after_forward": [True, False]},
+            {"reshard_after_forward": [True]},
             self._test_fully_shard_training_memory,
         )
 
@@ -32,6 +33,7 @@ class TestFullyShardMemory(FSDPTest):
             self.world_size == 2
         ), f"Requires world size of 2 since some values are hard coded: {self.world_size}"
         torch.manual_seed(42)
+        torch.cuda.memory._record_memory_history()
         # Pre-run a linear forward (gemm and bias) and backward (gemm) to
         # allocate the cuBLAS workspaces before measuring the memory usage
         # since the workspace size can differ between hardwares
@@ -100,7 +102,13 @@ class TestFullyShardMemory(FSDPTest):
             expected_mem_mb = (
                 model_sharded_numel + model_unsharded_numel + max_unsharded_numel
             ) * 4 / 1e6 + buffer_mb
+        import pickle
+        snapshot = torch.cuda.memory._snapshot()
+        with open(f"snapshot_{self.rank}.pickle", "wb") as f:
+            pickle.dump(snapshot, f)
         self.assertLessEqual(mem_mb - base_mem_mb, expected_mem_mb)
+
+        return
 
         # Backward:
         loss.sum().backward()

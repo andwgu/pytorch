@@ -65,12 +65,6 @@ class FSDPState(_State):
         self._module = module
         self._device = device
         self._mp_policy = mp_policy
-        self._pre_forward_hook_handle = module.register_forward_pre_hook(
-            self._pre_forward, prepend=True, with_kwargs=True
-        )
-        self._post_forward_hook_handle = module.register_forward_hook(
-            self._post_forward, prepend=False
-        )
 
     def _root_pre_forward(
         self, module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]

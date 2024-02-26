@@ -82,18 +82,37 @@ def foreach_all_gather_copy_out(
         all_gather_work.wait()
     world_size = group.size()
     dtype, device = all_gather_output.dtype, all_gather_output.device
+    # for all_gather_input_numel, fsdp_param in zip(all_gather_input_numels, fsdp_params):
+    #     fsdp_param.init_all_gather_output(
+    #         all_gather_input_numel, world_size, dtype, device
+    #     )  # no-op after 1st call
+    #     fsdp_param.alloc_all_gather_output()
+    out = []
     for all_gather_input_numel, fsdp_param in zip(all_gather_input_numels, fsdp_params):
-        fsdp_param.init_all_gather_output(
-            all_gather_input_numel, world_size, dtype, device
-        )  # no-op after 1st call
-        fsdp_param.alloc_all_gather_output()
+        all_gather_output_size = torch.Size([all_gather_input_numel * world_size])
+        out.append(torch.empty(all_gather_output_size, dtype=dtype, device=device).view(world_size, -1))
     all_gather_output = all_gather_output.view(world_size, -1)
-    out = [
-        fsdp_param.all_gather_output.view(world_size, -1) for fsdp_param in fsdp_params
-    ]
+    # if torch.distributed.get_rank() == 0:
+    #     print(f"out: {[o.shape for o in out]}")
+    #     print(f"all_gather_output: {all_gather_output.shape}")
     torch.split_with_sizes_copy(
         all_gather_output, all_gather_input_numels, dim=1, out=out
     )
+    unsharded_params = []
+    for all_gather_output, fsdp_param in zip(out, fsdp_params):
+        padded_size = _get_dim0_padded_size(fsdp_param._orig_size, world_size)
+
+        unsharded_params.append(
+            all_gather_output.view(padded_size).narrow(0, 0, fsdp_param._orig_size[0])
+            # torch.as_strided(
+            #     all_gather_output,
+            #     fsdp_param._orig_size,
+            #     fsdp_param._contiguous_orig_stride,
+            #     storage_offset=0,
+            # )
+        )
+    return unsharded_params
+
 
 
 @torch.no_grad()

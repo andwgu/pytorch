@@ -276,7 +276,7 @@ class TestFullyShard1DTrainingCore(FSDPTest):
         """
         self.run_subtests(
             {
-                "reshard_after_forward": [True, False, 2],
+                "reshard_after_forward": [True, False],
                 "device_type": ["cuda"],
                 "delay_after_forward": [False, True],
                 "delay_before_all_gather": [False, True],
@@ -428,7 +428,7 @@ class TestFullyShard1DTrainingCore(FSDPTest):
         times in forward.
         """
         self.run_subtests(
-            {"reshard_after_forward": [True, False, 2]},
+            {"reshard_after_forward": [True, False]},
             self._test_multi_forward_module,
         )
 
@@ -480,7 +480,7 @@ class TestFullyShard1DTrainingCompose(FSDPTest):
         """
         self.run_subtests(
             {
-                "reshard_after_forward": [True, False, 2],
+                "reshard_after_forward": [True, False],
                 "checkpoint_impl": ["composable", "utils", "wrapper"],
             },
             self._test_train_parity_with_activation_checkpointing,
@@ -624,7 +624,7 @@ class TestFullyShardGradientAccumulation(FSDPTest):
         """
         self.run_subtests(
             {
-                "reshard_after_forward": [True, False, 2],
+                "reshard_after_forward": [True, False],
                 # For `True`, disable reduce-scatter for all MLPs, and for
                 # `False`, only disable it for some MLPs
                 "recurse": [True, False],

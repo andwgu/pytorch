@@ -8,6 +8,9 @@ import torch.nn as nn
 from torch.distributed._composable import contract
 from torch.distributed._tensor import DeviceMesh, DTensor
 
+from torch.utils.checkpoint import checkpoint, _ignored_ops
+from torch.testing._internal.composite_compliance import is_view_fn
+from torch.distributed._tensor import DeviceMesh
 from ._fsdp_api import MixedPrecisionPolicy
 from ._fsdp_common import FSDPMeshInfo, HSDPMeshInfo
 from ._fsdp_init import (
@@ -20,6 +23,15 @@ from ._fsdp_init import (
 )
 from ._fsdp_param_group import FSDPParamGroup
 from ._fsdp_state import _get_module_fsdp_state, FSDPState
+from ._checkpoint import selective_checkpoint_context_fn
+
+
+_additional_ignored_ops = {
+    torch.ops.aten.lift_fresh.default,
+    torch.ops.profiler._record_function_exit._RecordFunction,
+    torch.ops.aten.clone.default,  # seems needed for torch.compile
+}
+OPS_TO_ALWAYS_SKIP = _ignored_ops | _additional_ignored_ops
 
 
 # The decorator adds a state object to `module` that can be accessed via
@@ -138,6 +150,15 @@ def unimplemented_deepcopy(*args: Any, **kwargs: Any) -> typing_extensions.Never
     )
 
 
+IN_FSDP_PRE_FORWARD = False
+
+
+def _policy_fn(mode: str, func, *args: Any, **kwargs: Any) -> bool:
+    if func in OPS_TO_ALWAYS_SKIP or IN_FSDP_PRE_FORWARD or is_view_fn(func):
+        return False  # recompute
+    return True
+
+
 class FSDP:
     def __new__(cls, *args, **kwargs):
         """
@@ -150,6 +171,24 @@ class FSDP:
         self = orig_cls.__new__(orig_cls, *args, **kwargs)
         self.__init__(*args, **kwargs)
         return self
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        state = self._get_fsdp_state()
+        args, kwargs = state._root_pre_forward(self, args, kwargs)
+        # if not state._state_ctx.iter_forward_root is state:
+        if True:
+            context_fn = lambda : selective_checkpoint_context_fn(_policy_fn)
+            return checkpoint(self._forward, *args, use_reentrant=False, context_fn=context_fn, **kwargs)
+        return self._forward(*args, **kwargs)
+
+    def _forward(self, *args: Any, **kwargs: Any) -> Any:
+        global IN_FSDP_PRE_FORWARD
+        state = self._get_fsdp_state()
+        IN_FSDP_PRE_FORWARD = True
+        args, kwargs = state._pre_forward(self, args, kwargs)
+        IN_FSDP_PRE_FORWARD = False
+        output = super().forward(*args, **kwargs)
+        return state._post_forward(self, args, output)
 
     def reshard(self) -> None:
         """

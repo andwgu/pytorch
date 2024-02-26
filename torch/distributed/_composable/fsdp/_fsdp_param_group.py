@@ -276,14 +276,30 @@ class FSDPParamGroup:
     ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
         with torch.profiler.record_function("FSDP::pre_forward"):
             self._training_state = TrainingState.FORWARD
-            self.unshard()
-            self.wait_for_unshard()
+
+            unsharded_params = AllGatherFunction.apply(
+                [fsdp_param.sharded_param for fsdp_param in self.fsdp_params],
+                self.fsdp_params,
+                self._all_gather_process_group,
+                False,
+                *self.comm_ctx.get_all_gather_streams(self._training_state),
+                self.device,
+            )
+            for fsdp_param, unsharded_param in zip(self.fsdp_params, unsharded_params):
+                fsdp_param._setattr_on_modules(unsharded_param)
+                fsdp_param.sharded_state = ShardedState.UNSHARDED
+
+
+            # self.unshard()
+            # self.wait_for_unshard()
             args, kwargs = self._register_post_backward_hook(args, kwargs)
             return args, kwargs
 
     def post_forward(self, module: nn.Module, input: Any, output: Any):
         with torch.profiler.record_function("FSDP::post_forward"):
             self.reshard()
+            for fsdp_param in self.fsdp_params:
+                fsdp_param.to_sharded()
             self._record_post_forward()
             self._training_state = TrainingState.IDLE
             return output
@@ -525,3 +541,39 @@ class RegisterPostBackwardFunction(torch.autograd.Function):
     def backward(ctx, *grads: torch.Tensor):
         ctx.param_group.post_backward()
         return (None,) + grads
+
+
+class AllGatherFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        sharded_params: List[nn.Parameter],
+        fsdp_params: List[FSDPParam],
+        group: dist.ProcessGroup,
+        async_op: bool,
+        all_gather_copy_in_stream,
+        all_gather_stream,
+        device,
+    ):
+        ctx.fsdp_params = fsdp_params
+        all_gather_result = foreach_all_gather(
+            fsdp_params,
+            group,
+            async_op,
+            all_gather_copy_in_stream,
+            all_gather_stream,
+            device,
+        )
+        unsharded_params = foreach_all_gather_copy_out(all_gather_result, fsdp_params, group)
+        # for fsdp_param in fsdp_params:
+        #     fsdp_param.to_unsharded()
+        # unsharded_params = [
+        #     fsdp_param.unsharded_param for fsdp_param in fsdp_params
+        # ]
+        return unsharded_params
+
+    @staticmethod
+    def backward(ctx, *grads: torch.Tensor):
+        ...
+        sharded_grads = ...
+        return sharded_grads

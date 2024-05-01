@@ -194,7 +194,14 @@ def foreach_reduce(
                 )
     with torch.cuda.stream(post_reduce_stream):
         _div_if_needed(reduce_output, postdivide_factor)
-        reduce_output = _to_dtype_if_needed(reduce_output, orig_dtype)
+        use_main_grad = orig_dtype.itemsize < reduce_output.itemsize
+        if use_main_grad:  # e.g., orig=bf16, reduce=fp32
+            # Specially keep gradients in fp32 and assign them to `main_grad`
+            assert (
+                reduce_output.dtype == torch.float32
+            ), f"Using .main_grad assumes fp32 reduction but got {reduce_output.dtype}"
+        else:
+            reduce_output = _to_dtype_if_needed(reduce_output, orig_dtype)
         # View out and accumulate sharded gradients
         flat_grad_offset = 0  # [0, reduce_scatter_output_numel - 1]
         for padded_unsharded_size, fsdp_param in zip(
@@ -224,9 +231,15 @@ def foreach_reduce(
                     fsdp_param.grad_offload_event = reduce_scatter_stream.record_event()
             new_sharded_dtensor_grad = fsdp_param.to_sharded_dtensor(new_sharded_grad)
             if to_accumulate_grad:
-                fsdp_param.sharded_param.grad += new_sharded_dtensor_grad
+                if use_main_grad:
+                    fsdp_param.sharded_param.main_grad += new_sharded_dtensor_grad
+                else:
+                    fsdp_param.sharded_param.grad += new_sharded_dtensor_grad
             else:
-                fsdp_param.sharded_param.grad = new_sharded_dtensor_grad
+                if use_main_grad:
+                    fsdp_param.sharded_param.main_grad = new_sharded_dtensor_grad
+                else:
+                    fsdp_param.sharded_param.grad = new_sharded_dtensor_grad
             padded_sharded_numel = padded_unsharded_size.numel() // world_size
             flat_grad_offset += padded_sharded_numel
         post_reduce_event = post_reduce_stream.record_event()

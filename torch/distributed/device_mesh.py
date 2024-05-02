@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import logging
+import functools
 import math
 import threading
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING, Union
@@ -430,13 +431,34 @@ else:
                 return dim_groups
 
         @staticmethod
-        def from_group(group: ProcessGroup, device_type: str) -> "DeviceMesh":
+        def from_group(
+            group: Union[ProcessGroup, Tuple[ProcessGroup, ...]],
+            device_type: str,
+            *,
+            mesh_dim_names: Optional[Tuple[str, ...]] = None,
+        ) -> "DeviceMesh":
             """
             Contstructs a :class:`DeviceMesh` with ``device_type`` from an
             existing :class:`ProcessGroup`.
 
             The constructed device mesh is assumed to be 1D.
             """
+            # if not isinstance(group, (ProcessGroup, tuple)):
+            #     raise ValueError(
+            #         f"Expects either ProcessGroup of tuple of ProcessGroup but got {group}"
+            #     )
+            # all_groups = (group,) if isinstance(group, ProcessGroup) else group
+            # ndim = len(all_groups)
+
+
+            # all_process_group_ranks = [
+            #     set(get_process_group_ranks(g)) for g in all_groups
+            # ]
+            # all_ranks = functools.reduce(
+            #     lambda x, y: x.union(y), all_process_group_ranks
+            # )
+
+
             # Manually define `_dim_group_infos` instead of relying on the
             # normal logic since we already have the PG
             group_ranks = get_process_group_ranks(group)

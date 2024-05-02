@@ -37,6 +37,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     Transformer,
     TransformerBlock,
 )
+from torch.distributed.fsdp._init_utils import _init_intra_node_process_group, _init_inter_node_process_group
 
 
 class TestFullyShardDeviceTensor(FSDPTestMultiThread):
@@ -672,7 +673,7 @@ class TestFullyShardProcessGroupInit(FSDPTestMultiThread):
         return 4
 
     @unittest.skipIf(not TEST_CUDA, "no cuda")
-    def test_process_group_init(self):
+    def test_1d_process_group_init(self):
         assert self.world_size == 4, f"{self.world_size}"
         # For convenience, use device mesh's infra to construct the DP PG
         # (in practice, the trainer would do it manually via `new_group()`)
@@ -715,6 +716,64 @@ class TestFullyShardProcessGroupInit(FSDPTestMultiThread):
         elif self.rank in (2, 3):
             dist.broadcast(inp, src=2, group=tp_mesh.get_group(0))
 
+        ref_loss = ref_model(inp).sum()
+        ref_loss.backward()
+        loss = model(inp).sum()
+        loss.backward()
+        self.assertEqual(loss, ref_loss)
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            self.assertEqual(param, ref_param)
+            self.assertEqual(param.grad, ref_param.grad)
+
+    @unittest.skipIf(not TEST_CUDA, "no cuda")
+    def test_2d_process_group_init(self):
+        shard_mesh_dim_size = 2
+        assert (
+            self.world_size % shard_mesh_dim_size == 0
+        ), f"Expects {self.world_size} to be divisible by {shard_mesh_dim_size}"
+        replicate_mesh_dim_size = self.world_size // shard_mesh_dim_size
+        global_pg = dist.distributed_c10d._get_default_group()
+        intra_node_pg = _init_intra_node_process_group(shard_mesh_dim_size)
+        inter_node_pg = _init_inter_node_process_group(
+            global_pg, shard_mesh_dim_size
+        )
+
+        if self.rank == 0:
+            print(f"intra_node_pg: {dist.distributed_c10d.get_process_group_ranks(intra_node_pg)}")
+            print(f"inter_node_pg: {dist.distributed_c10d.get_process_group_ranks(inter_node_pg)}")
+
+        mesh_dim_names = ("replicate", "shard")
+        ref_mesh = init_device_mesh(
+            "cuda",
+            (replicate_mesh_dim_size, shard_mesh_dim_size),
+            mesh_dim_names=mesh_dim_names,
+        )
+
+        if self.rank == 0:
+            print(f"ref_mesh._dim_group_infos: {ref_mesh._dim_group_infos}")
+
+
+
+        exit()
+        mesh = DeviceMesh.from_group(
+            (inter_node_pg, intra_node_pg), "cuda", mesh_dim_names=mesh_dim_names
+        )
+
+        torch.manual_seed(42)
+        mlp_dim = 8
+        ref_model = MLP(mlp_dim)
+        for param in ref_model.parameters():
+            dist.broadcast(param.detach(), src=0)
+        model = copy.deepcopy(ref_model)
+
+        # Parallelize the test model with the ref mesh
+        for module in (ref_model.in_proj, ref_model.out_proj, ref_model):
+            fully_shard(module, mesh=ref_mesh)
+        # Parallelize the test model with the new mesh from the PG
+        for module in (model.in_proj, model.out_proj, model):
+            fully_shard(module, mesh=mesh)
+
+        inp = torch.randn((4, mlp_dim), device="cuda")
         ref_loss = ref_model(inp).sum()
         ref_loss.backward()
         loss = model(inp).sum()

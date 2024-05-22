@@ -387,7 +387,8 @@ def _inject_property(module: Module, tensor_name: str) -> None:
         if torch.jit.is_scripting():
             raise RuntimeError("Parametrization is not working with scripting.")
         parametrization = self.parametrizations[tensor_name]
-        if _cache_enabled:
+        # if _cache_enabled:
+        if True:  # HACK: always look up in cache
             if torch.jit.is_scripting():
                 # Scripting
                 raise RuntimeError(

@@ -262,12 +262,26 @@ def foreach_all_gather_copy_out(
                 force_recreate=True,
             )
         else:
+            # TODO: May need to defer this for parameters not sharded on dim-0
+            # until after initial copy-out since we will hold extra memory.
             fsdp_param.init_all_gather_outputs(
                 all_gather_input_numels, all_gather_input_dtypes, world_size, device
             )  # no-op after 1st call
             fsdp_param.alloc_all_gather_outputs()
     all_gather_output = all_gather_output.view(world_size, -1)
-    gen = (t for fsdp_param in fsdp_params for t in fsdp_param.all_gather_outputs)
+
+    gen: List[torch.Tensor] = []
+    copy_infos: List[Tuple[FSDPParam, List[torch.Tensor]]] = []
+    for fsdp_param in fsdp_params:
+        if fsdp_param.fsdp_placement.dim == 0:
+            gen.extend(fsdp_param.all_gather_outputs)
+        else:
+            param_all_gather_outputs = [
+                torch.empty_like(t) for t in fsdp_param.all_gather_outputs
+            ]
+            gen.extend(param_all_gather_outputs)
+            copy_infos.append((fsdp_param, param_all_gather_outputs))
+
     if all_gather_output.dtype == torch.uint8:
         out = [t.view(world_size, -1).view(torch.uint8) for t in gen]
     else:
@@ -275,6 +289,40 @@ def foreach_all_gather_copy_out(
     torch.ops.fsdp.split_with_sizes_copy(
         all_gather_output, all_gather_input_split_sizes, dim=1, out=out
     )
+    for fsdp_param, param_all_gather_outputs in copy_infos:
+        shard_dim = fsdp_param.fsdp_placement.dim
+        for param_all_gather_output, target_all_gather_output in zip(
+            param_all_gather_outputs, fsdp_param.all_gather_outputs
+        ):
+            pre_param_size = list(fsdp_param.padded_sharded_param_size)
+            pre_param_size[0] *= world_size
+            chunks = torch.chunk(
+                param_all_gather_output.view(pre_param_size), world_size, dim=0
+            )
+            post_param_size = list(fsdp_param.padded_sharded_param_size)
+            post_param_size[shard_dim] *= world_size
+            unpadded_chunks = []
+            for chunk, chunk_size in zip(chunks, fsdp_param._shard_chunk_sizes):
+                if chunk.size() == chunk_size:
+                    unpadded_chunk = chunk
+                else:
+                    unpadded_chunk = chunk.narrow(
+                        dim=shard_dim,
+                        start=0,
+                        length=chunk_size[shard_dim] if chunk_size.numel() > 0 else 0,
+                    )
+                unpadded_chunks.append(unpadded_chunk)
+            cat_out = target_all_gather_output.view(post_param_size).narrow(
+                dim=shard_dim,
+                start=0,
+                length=sum(
+                    t.size(shard_dim) if t.numel() > 0 else 0 for t in unpadded_chunks
+                ),
+            )
+            torch.cat(unpadded_chunks, dim=shard_dim, out=cat_out)
+            torch._C._autograd._unsafe_set_version_counter(
+                target_all_gather_output, target_all_gather_output._version - 1
+            )
 
 
 @torch.no_grad()
@@ -309,6 +357,20 @@ def foreach_reduce(
         reduce_scatter_group, all_reduce_group, reduce_dtype
     )
     world_size = reduce_scatter_group.size()
+    for i, (fsdp_param, unsharded_grad) in enumerate(zip(fsdp_params, unsharded_grads)):
+        shard_dim = fsdp_param.fsdp_placement.dim
+        if shard_dim != 0:
+            if unsharded_grad.size(shard_dim) % world_size != 0:
+                _padded_unsharded_size = list(fsdp_param.padded_sharded_param_size)
+                _padded_unsharded_size[shard_dim] *= world_size
+                padded_unsharded_grad = unsharded_grad.new_empty(_padded_unsharded_size)
+                padded_unsharded_grad.narrow(
+                    dim=shard_dim, start=0, length=unsharded_grad.size(shard_dim)
+                ).copy_(unsharded_grad)
+                unsharded_grad = padded_unsharded_grad
+            chunks = torch.chunk(unsharded_grad, world_size, dim=shard_dim)
+            new_unsharded_grad = torch.cat(chunks, dim=0)
+            unsharded_grads[i] = new_unsharded_grad
     padded_unsharded_sizes = tuple(
         _get_dim0_padded_size(grad.size(), world_size) for grad in unsharded_grads
     )
@@ -369,12 +431,29 @@ def foreach_reduce(
         for padded_unsharded_size, fsdp_param in zip(
             padded_unsharded_sizes, fsdp_params
         ):
-            new_sharded_grad = torch.as_strided(
-                reduce_output,
-                size=fsdp_param.sharded_size,
-                stride=fsdp_param.contiguous_sharded_stride,
-                storage_offset=flat_grad_offset,
-            )
+            shard_dim = fsdp_param.fsdp_placement.dim
+            if shard_dim == 0:
+                new_sharded_grad = torch.as_strided(
+                    reduce_output,
+                    size=fsdp_param.sharded_size,
+                    stride=fsdp_param.contiguous_sharded_stride,
+                    storage_offset=flat_grad_offset,
+                )
+            else:
+                new_sharded_grad = (
+                    reduce_output[
+                        flat_grad_offset : flat_grad_offset
+                        + fsdp_param.padded_sharded_param_size.numel()
+                    ]
+                    .view(fsdp_param.padded_sharded_param_size)
+                    .narrow(
+                        dim=shard_dim,
+                        start=0,
+                        length=fsdp_param.sharded_size[shard_dim]
+                        if fsdp_param.sharded_size.numel() > 0
+                        else 0,
+                    )
+                )
             to_accumulate_grad = fsdp_param.sharded_param.grad is not None
             if fsdp_param.offload_to_cpu:
                 # Only overlap the D2H copy (copying to pinned memory) if not

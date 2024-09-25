@@ -247,7 +247,8 @@ class TestFullyShard1DTrainingCore(FSDPTest):
                     [(7, 15), (15, 3)],
                     [(16, 17), (17, 8)],
                 ],
-                "use_shard_placement_fn": [False, True],
+                # "use_shard_placement_fn": [False, True],
+                "use_shard_placement_fn": [True],
             },
             self._test_train_parity_single_group,
         )

@@ -204,11 +204,15 @@ def _get_param_all_gather_inputs(
     for i, fsdp_param in enumerate(fsdp_params):
         if use_foreach_copy(fsdp_param):
             foreach_copy_indices.append(i)
-            all_gather_input = (
-                fsdp_param._sharded_param_data
-                if fsdp_param.sharded_state == ShardedState.SHARDED
-                else cast(torch.Tensor, fsdp_param._sharded_post_forward_param_data)
-            )
+            if fsdp_param.sharded_state == ShardedState.SHARDED and fsdp_param.fsdp_placement.dim == 0:
+                all_gather_input = fsdp_param._sharded_param_data
+            elif fsdp_param.sharded_state == ShardedState.SHARDED:
+                all_gather_input = fsdp_param._pad_sharded_param_if_needed(
+                    fsdp_param._sharded_local_tensor
+                ).view(-1)
+            else:
+                all_gather_input = cast(torch.Tensor, fsdp_param._sharded_post_forward_param_data)
+            assert all_gather_input.ndim == 1, f"{all_gather_input.shape}"
             foreach_copy_inputs.append(all_gather_input)
             foreach_copy_input_numels.append(all_gather_input.numel())
         else:
@@ -294,6 +298,7 @@ def foreach_all_gather_copy_out(
         for param_all_gather_output, target_all_gather_output in zip(
             param_all_gather_outputs, fsdp_param.all_gather_outputs
         ):
+            # TODO: This shape is wrong for the SHARDED_POST_FORWARD case.
             pre_param_size = list(fsdp_param.padded_sharded_param_size)
             pre_param_size[0] *= world_size
             chunks = torch.chunk(

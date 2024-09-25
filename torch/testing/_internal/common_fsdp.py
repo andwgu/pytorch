@@ -1117,7 +1117,12 @@ def check_sharded_parity(
         sharded_ref_grad = distribute_tensor(replicated_param.grad, mesh, placements)
         cls.assertIsInstance(sharded_param.grad, DTensor)
         assert isinstance(sharded_param.grad, DTensor)  # mypy
-        cls.assertEqual(sharded_param.grad.to_local(), sharded_ref_grad.to_local())
+        try:
+            cls.assertEqual(sharded_param.grad.to_local(), sharded_ref_grad.to_local())
+        except Exception as e:
+            if torch.distributed.get_rank() == 0:
+                print(f"{replicated_name} mismatched {sharded_param.shape} {placements=}")
+            raise e
 
 
 class FSDPTestMultiThread(MultiThreadedTestCase):
